@@ -135,7 +135,7 @@ experimental slight-speedup path.
 Start a local OpenAI/Anthropic-compatible server:
 
 ```sh
-./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
+DS4_METAL_PREFILL_CHUNK=4096 ./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 32768
 ```
 
 The server is Metal-only. It keeps one mutable graph/KV checkpoint in memory,
@@ -188,7 +188,7 @@ chat completions. Start the server first, and set the client context limit no
 higher than the `--ctx` value you started the server with:
 
 ```sh
-./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
+DS4_METAL_PREFILL_CHUNK=4096 ./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 32768
 ```
 
 You can use larger context and larger cache if you wish. Full context of
@@ -355,7 +355,7 @@ different sessions.
 Enable it with:
 
 ```sh
-./ds4-server --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
+DS4_METAL_PREFILL_CHUNK=4096 ./ds4-server --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 32768
 ```
 
 The cache key is the SHA1 of exact token IDs, not raw text. Each token ID is

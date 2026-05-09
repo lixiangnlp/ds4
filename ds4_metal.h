@@ -110,6 +110,17 @@ int ds4_metal_indexer_topk_tensor(
         uint32_t                n_tokens,
         uint32_t                top_k);
 
+/* GPU-side vocab top-k for sampling.  Runs argsort on `logits` (length n_vocab)
+ * to produce `top_k` indices, then gathers the matching logit values into
+ * `out_vals`.  The sampler can then read back top_k * 8 bytes instead of the
+ * full vocab row, which is ~516 KB at DS4_N_VOCAB=129280. */
+int ds4_metal_logits_top_k_tensor(
+        ds4_metal_tensor       *out_ids,
+        ds4_metal_tensor       *out_vals,
+        const ds4_metal_tensor *logits,
+        uint32_t                n_vocab,
+        uint32_t                top_k);
+
 int ds4_metal_dsv4_topk_mask_tensor(
         ds4_metal_tensor       *mask,
         const ds4_metal_tensor *topk,

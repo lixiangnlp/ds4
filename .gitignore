@@ -8,5 +8,7 @@
 /gguf/
 *.o
 *.dSYM/
+__pycache__/
 /misc/
+/bench/results/
 .*.swp

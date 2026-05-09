@@ -40,6 +40,8 @@ typedef struct {
     bool metal_graph_test;
     bool metal_graph_full_test;
     bool metal_graph_prompt_test;
+    bool quiet;
+    const char *bench_json_path;
 } cli_generation_options;
 
 typedef struct {
@@ -121,6 +123,8 @@ static void usage(FILE *fp) {
         "      Use Think Max when --ctx is at least 393216 tokens; otherwise normal thinking.\n"
         "  --nothink\n"
         "      Start assistant turns with </think> for direct non-thinking replies.\n"
+        "  --quiet\n"
+        "      Suppress generated text. Useful for benchmark runs.\n"
         "\n"
         "Interactive commands:\n"
         "  /help\n"
@@ -155,6 +159,8 @@ static void usage(FILE *fp) {
         "      Run the GPU-resident self-token graph across all layers.\n"
         "  --metal-graph-prompt-test\n"
         "      Compare CPU and GPU graph logits for the full prompt.\n"
+        "  --bench-json FILE\n"
+        "      Write prompt/decode timing metrics as JSON. Implies a session benchmark path.\n"
         "\n"
         "Normal CLI commands:\n"
         "  ./ds4\n"
@@ -424,7 +430,92 @@ static void build_prompt(ds4_engine *engine, const cli_generation_options *gen, 
     }
 }
 
+static void bench_json_string(FILE *fp, const char *s) {
+    fputc('"', fp);
+    if (s) {
+        for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+            if (*p == '"' || *p == '\\') {
+                fputc('\\', fp);
+                fputc(*p, fp);
+            } else if (*p == '\n') {
+                fputs("\\n", fp);
+            } else if (*p == '\r') {
+                fputs("\\r", fp);
+            } else if (*p == '\t') {
+                fputs("\\t", fp);
+            } else if (*p < 0x20) {
+                fprintf(fp, "\\u%04x", (unsigned)*p);
+            } else {
+                fputc(*p, fp);
+            }
+        }
+    }
+    fputc('"', fp);
+}
+
+static int write_bench_json(const cli_config *cfg,
+                            int prompt_tokens,
+                            int generated_tokens,
+                            uint64_t token_hash,
+                            double prefill_s,
+                            double decode_s,
+                            double total_s,
+                            bool gpu_top1,
+                            bool mtp_enabled) {
+    if (!cfg->gen.bench_json_path) return 0;
+    FILE *fp = fopen(cfg->gen.bench_json_path, "wb");
+    if (!fp) {
+        fprintf(stderr, "ds4: failed to open --bench-json file: %s\n", cfg->gen.bench_json_path);
+        return 1;
+    }
+    ds4_context_memory mem = ds4_context_memory_estimate(cfg->engine.backend, cfg->gen.ctx_size);
+    fprintf(fp, "{\n");
+    fprintf(fp, "  \"source\":\"ds4\",\n");
+    fprintf(fp, "  \"model\":");
+    bench_json_string(fp, cfg->engine.model_path);
+    fprintf(fp, ",\n  \"backend\":");
+    bench_json_string(fp, ds4_backend_name(cfg->engine.backend));
+    fprintf(fp, ",\n");
+    fprintf(fp, "  \"ctx\":%d,\n", cfg->gen.ctx_size);
+    fprintf(fp, "  \"prompt_tokens\":%d,\n", prompt_tokens);
+    fprintf(fp, "  \"generated_tokens\":%d,\n", generated_tokens);
+    fprintf(fp, "  \"generated_token_hash\":\"%016llx\",\n", (unsigned long long)token_hash);
+    fprintf(fp, "  \"prefill_seconds\":%.9f,\n", prefill_s);
+    fprintf(fp, "  \"decode_seconds\":%.9f,\n", decode_s);
+    fprintf(fp, "  \"total_seconds\":%.9f,\n", total_s);
+    fprintf(fp, "  \"prefill_tokens_per_second\":%.9f,\n",
+            prefill_s > 0.0 ? (double)prompt_tokens / prefill_s : 0.0);
+    fprintf(fp, "  \"decode_tokens_per_second\":%.9f,\n",
+            decode_s > 0.0 ? (double)generated_tokens / decode_s : 0.0);
+    fprintf(fp, "  \"temperature\":%.9g,\n", cfg->gen.temperature);
+    fprintf(fp, "  \"top_p\":%.9g,\n", cfg->gen.top_p);
+    fprintf(fp, "  \"gpu_top1\":%s,\n", gpu_top1 ? "true" : "false");
+    fprintf(fp, "  \"mtp_enabled\":%s,\n", mtp_enabled ? "true" : "false");
+    fprintf(fp, "  \"mtp_draft_tokens\":%d,\n", cfg->engine.mtp_draft_tokens);
+    fprintf(fp, "  \"quality\":%s,\n", cfg->engine.quality ? "true" : "false");
+    fprintf(fp, "  \"warm_weights\":%s,\n", cfg->engine.warm_weights ? "true" : "false");
+    fprintf(fp, "  \"prefill_chunk\":%u,\n", mem.prefill_cap);
+    fprintf(fp, "  \"raw_kv_rows\":%u,\n", mem.raw_cap);
+    fprintf(fp, "  \"compressed_kv_rows\":%u,\n", mem.comp_cap);
+    fprintf(fp, "  \"context_buffer_bytes\":%llu,\n", (unsigned long long)mem.total_bytes);
+    fprintf(fp, "  \"env\":{\n");
+    fprintf(fp, "    \"DS4_METAL_PREFILL_CHUNK\":");
+    bench_json_string(fp, getenv("DS4_METAL_PREFILL_CHUNK"));
+    fprintf(fp, ",\n    \"DS4_METAL_GRAPH_RAW_CAP\":");
+    bench_json_string(fp, getenv("DS4_METAL_GRAPH_RAW_CAP"));
+    fprintf(fp, ",\n    \"DS4_GREEDY_GPU_TOP1\":");
+    bench_json_string(fp, getenv("DS4_GREEDY_GPU_TOP1"));
+    fprintf(fp, "\n  }\n");
+    fprintf(fp, "}\n");
+    if (fclose(fp) != 0) {
+        fprintf(stderr, "ds4: failed to close --bench-json file: %s\n", cfg->gen.bench_json_path);
+        return 1;
+    }
+    return 0;
+}
+
 static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
+    const double t_total0 = cli_now_sec();
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
         fprintf(stderr, "ds4: sampled CLI generation requires the Metal session backend\n");
@@ -466,14 +557,28 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
     uint64_t rng = cfg->gen.seed ? cfg->gen.seed :
         ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
     int generated = 0;
+    uint64_t token_hash = 1469598103934665603ull;
+    const bool gpu_top1 = getenv("DS4_GREEDY_GPU_TOP1") != NULL &&
+                          cfg->gen.temperature <= 0.0f &&
+                          ds4_engine_mtp_draft_tokens(engine) <= 1;
+    int fast_next = gpu_top1 ? ds4_session_argmax(session) : -1;
     const double t_decode0 = cli_now_sec();
     while (generated < max_tokens && !cli_interrupt_requested()) {
-        int token = ds4_session_sample(session, cfg->gen.temperature, 0, cfg->gen.top_p, 0.0f, &rng);
+        int token = gpu_top1 ? fast_next :
+            ds4_session_sample(session, cfg->gen.temperature, 0, cfg->gen.top_p, 0.0f, &rng);
         if (token == ds4_token_eos(engine)) break;
 
         int toks[17];
         int ntok = 0;
-        if (cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
+        if (gpu_top1) {
+            if (ds4_session_eval_argmax_fast(session, token, &fast_next, err, sizeof(err)) != 0) {
+                fprintf(stderr, "ds4: decode failed: %s\n", err);
+                ds4_session_free(session);
+                return 1;
+            }
+            toks[0] = token;
+            ntok = 1;
+        } else if (cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
             ntok = ds4_session_eval_speculative_argmax(session,
                                                        token,
@@ -505,29 +610,44 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
                 break;
             }
             size_t piece_len = 0;
-            char *piece = ds4_token_text(engine, toks[j], &piece_len);
-            token_printer_write_text(&printer, piece, piece_len);
-            fflush(stdout);
-            free(piece);
+            if (!cfg->gen.quiet) {
+                char *piece = ds4_token_text(engine, toks[j], &piece_len);
+                token_printer_write_text(&printer, piece, piece_len);
+                fflush(stdout);
+                free(piece);
+            }
+            token_hash ^= (uint64_t)(uint32_t)toks[j];
+            token_hash *= 1099511628211ull;
             generated++;
             if (generated >= max_tokens) break;
         }
         if (stop) break;
     }
     const double t_decode1 = cli_now_sec();
-    generation_done(&printer);
+    if (!cfg->gen.quiet) generation_done(&printer);
     if (cli_interrupt_requested()) cli_interrupt_clear();
 
     const double prefill_s = t_prefill1 - t_prefill0;
     const double decode_s = t_decode1 - t_decode0;
+    const double total_s = t_decode1 - t_total0;
     ds4_log(stderr,
             DS4_LOG_TIMING,
             "ds4: prefill: %.2f t/s, generation: %.2f t/s\n",
             prefill_s > 0.0 ? (double)prompt->len / prefill_s : 0.0,
             decode_s > 0.0 ? (double)generated / decode_s : 0.0);
 
+    int bench_rc = write_bench_json(cfg,
+                                    prompt->len,
+                                    generated,
+                                    token_hash,
+                                    prefill_s,
+                                    decode_s,
+                                    total_s,
+                                    gpu_top1,
+                                    ds4_engine_mtp_draft_tokens(engine) > 1 &&
+                                        getenv("DS4_MTP_SPEC_DISABLE") == NULL);
     ds4_session_free(session);
-    return 0;
+    return bench_rc;
 }
 
 static bool json_utf8_valid(const char *s, size_t n) {
@@ -722,7 +842,8 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
             fprintf(stderr, "ds4: diagnostic run completed on the native %s path.\n",
                     ds4_backend_name(cfg->engine.backend));
         }
-    } else if (cfg->gen.temperature > 0.0f || ds4_engine_mtp_draft_tokens(engine) > 1) {
+    } else if (cfg->gen.bench_json_path || cfg->gen.quiet ||
+               cfg->gen.temperature > 0.0f || ds4_engine_mtp_draft_tokens(engine) > 1) {
         rc = run_sampled_generation(engine, cfg, &prompt);
     } else {
         token_printer printer = {
@@ -1231,6 +1352,8 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.think_mode = DS4_THINK_MAX;
         } else if (!strcmp(arg, "--nothink")) {
             c.gen.think_mode = DS4_THINK_NONE;
+        } else if (!strcmp(arg, "--quiet")) {
+            c.gen.quiet = true;
         } else if (!strcmp(arg, "--head-test")) {
             c.gen.head_test = true;
         } else if (!strcmp(arg, "--first-token-test")) {
@@ -1244,6 +1367,9 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--metal-graph-prompt-test")) {
             c.gen.metal_graph_prompt_test = true;
             c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--bench-json")) {
+            c.gen.bench_json_path = need_arg(&i, argc, argv, arg);
+            c.gen.quiet = true;
         } else if (!strcmp(arg, "--metal-graph-generate")) {
             fprintf(stderr, "ds4: --metal-graph-generate was removed; --metal is the graph path\n");
             exit(2);

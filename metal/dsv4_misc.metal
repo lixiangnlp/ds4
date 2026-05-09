@@ -272,6 +272,21 @@ kernel void kernel_dsv4_topk_mask_scatter(
     }
 }
 
+// Gathers logit values at GPU-selected vocabulary indices into a compact
+// (top_k) array, paired with the existing index buffer produced by argsort.
+// The host-side sampler then reads only top_k * (sizeof(uint32_t)+sizeof(float))
+// bytes back, instead of the full vocab logits row (~516 KB at 129280 vocab).
+kernel void kernel_logits_gather_top_k(
+        constant uint & top_k,
+        device const float * logits,
+        device const uint32_t * indices,
+        device float * out_vals,
+        uint tid [[thread_position_in_grid]]) {
+    if (tid >= top_k) return;
+    const uint idx = indices[tid];
+    out_vals[tid] = logits[idx];
+}
+
 // Sorts each token's selected compressed rows by row id. The indexer selects by
 // score, but attention scans compressed K/V in cache order in the dense graph.
 // Sorting preserves that order while still letting the indexed attention kernel

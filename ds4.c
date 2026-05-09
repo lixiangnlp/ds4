@@ -7882,6 +7882,12 @@ typedef struct {
     ds4_metal_tensor *output_norm;
     ds4_metal_tensor *logits;
 
+    /* GPU sampling scratch.  After decode, the sampler runs argsort+gather on
+     * `logits` directly into these compact (id, value) buffers, so the host
+     * only reads back top_k * 8 bytes instead of the full vocab logits row. */
+    ds4_metal_tensor *sample_topk_ids;
+    ds4_metal_tensor *sample_topk_vals;
+
     /* Optional MTP model state.  It has its own raw cache because the drafter
      * runs on speculative future tokens; target KV state is updated only after
      * verification accepts draft tokens. */
@@ -7989,6 +7995,8 @@ static void metal_graph_free(ds4_metal_graph *g) {
     ds4_metal_tensor_free(g->batch_cur_hc);
     ds4_metal_tensor_free(g->prefill_tokens);
     ds4_metal_tensor_free(g->logits);
+    ds4_metal_tensor_free(g->sample_topk_ids);
+    ds4_metal_tensor_free(g->sample_topk_vals);
     ds4_metal_tensor_free(g->mtp_raw_cache);
     ds4_metal_tensor_free(g->mtp_next_hc);
     ds4_metal_tensor_free(g->mtp_state_hc);
@@ -8345,6 +8353,10 @@ static bool metal_graph_alloc_raw_cap(
     g->output_embd = ds4_metal_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
     g->output_norm = ds4_metal_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
     g->logits = ds4_metal_tensor_alloc(vocab_dim * sizeof(float));
+    /* GPU-side sampling top-k (1024 is the upper bound we accept from any
+     * sampler config, see DS4_SAMPLE_TOPK_MAX in the session sampler). */
+    g->sample_topk_ids = ds4_metal_tensor_alloc((uint64_t)1024 * sizeof(uint32_t));
+    g->sample_topk_vals = ds4_metal_tensor_alloc((uint64_t)1024 * sizeof(float));
     /*
      * MTP is deliberately outside the normal graph footprint.  A session that
      * does not opt in with --mtp must allocate and execute exactly the same
@@ -12182,6 +12194,50 @@ static bool metal_graph_eval_token_raw_swa(
     if (!ok) {
         if (ds4_metal_synchronize() == 0) {
             fprintf(stderr, "ds4: Metal synchronize after graph eval failure also failed\n");
+        }
+    }
+    return ok;
+}
+
+/* Sampler fast path.  Runs decode + GPU argsort + gather inside one command
+ * buffer, then reads back top_k * (uint32_t + float).  The full vocab logits
+ * row stays on the GPU.  At DS4_N_VOCAB=129280 this turns a per-token 516 KB
+ * synchronous tensor read into ~8 KB at top_k=1024 (and ~8 B at top_k=1).
+ *
+ * Returns top_k pairs sorted by score desc.  out_ids[0]/out_vals[0] is the
+ * argmax. */
+static DS4_MAYBE_UNUSED bool metal_graph_eval_token_raw_swa_topk(
+        ds4_metal_graph *g,
+        const ds4_model       *model,
+        const ds4_weights     *weights,
+        int                    token,
+        uint32_t               pos,
+        uint32_t               top_k,
+        int                   *out_ids,
+        float                 *out_vals) {
+    if (!out_ids || !out_vals || top_k == 0 || top_k > DS4_N_VOCAB) return false;
+
+    bool ok = ds4_metal_begin_commands() != 0;
+    if (ok) ok = metal_graph_encode_token_raw_swa(g, model, weights, token, pos, true, true);
+    if (ok) ok = ds4_metal_logits_top_k_tensor(g->sample_topk_ids,
+                                               g->sample_topk_vals,
+                                               g->logits,
+                                               DS4_N_VOCAB,
+                                               top_k) != 0;
+    if (ok) ok = ds4_metal_end_commands() != 0;
+    if (ok) {
+        uint32_t ids_u32[1024];
+        ok = ds4_metal_tensor_read(g->sample_topk_ids, 0, ids_u32,
+                                   (uint64_t)top_k * sizeof(uint32_t)) != 0;
+        if (ok) ok = ds4_metal_tensor_read(g->sample_topk_vals, 0, out_vals,
+                                           (uint64_t)top_k * sizeof(float)) != 0;
+        if (ok) {
+            for (uint32_t i = 0; i < top_k; i++) out_ids[i] = (int)ids_u32[i];
+        }
+    }
+    if (!ok) {
+        if (ds4_metal_synchronize() == 0) {
+            fprintf(stderr, "ds4: Metal synchronize after top-k graph eval failure also failed\n");
         }
     }
     return ok;
@@ -16157,6 +16213,41 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
 
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
     return ds4_session_eval_internal(s, token, true, err, errlen);
+}
+
+int ds4_session_eval_argmax_fast(ds4_session *s, int token, int *next_token,
+                                 char *err, size_t errlen) {
+#ifdef DS4_NO_METAL
+    (void)s;
+    (void)token;
+    (void)next_token;
+    snprintf(err, errlen, "Metal support is not compiled in");
+    return 1;
+#else
+    if (!s || !next_token) {
+        snprintf(err, errlen, "invalid greedy fast-path state");
+        return 1;
+    }
+    ds4_engine *e = s->engine;
+    int top = -1;
+    if (!metal_graph_eval_token_raw_swa_top(&s->graph,
+                                            &e->model,
+                                            &e->weights,
+                                            token,
+                                            (uint32_t)s->checkpoint.len,
+                                            &top,
+                                            NULL))
+    {
+        snprintf(err, errlen, "Metal greedy top1 decode failed");
+        s->checkpoint_valid = false;
+        return 1;
+    }
+    token_vec_push(&s->checkpoint, token);
+    s->checkpoint_valid = true;
+    s->mtp_draft_valid = false;
+    *next_token = top;
+    return 0;
+#endif
 }
 
 /* Speculative decode state machine:

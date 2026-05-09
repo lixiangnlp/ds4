@@ -4564,7 +4564,7 @@ static void apply_openai_stream_tool_ids(tool_calls *calls,
 #define KV_CACHE_DEFAULT_BOUNDARY_TRIM_TOKENS 32
 #define KV_CACHE_DEFAULT_BOUNDARY_ALIGN_TOKENS 2048
 #define KV_CACHE_DEFAULT_CONTINUED_INTERVAL_TOKENS 10000
-#define KV_CACHE_DEFAULT_MB 4096
+#define KV_CACHE_DEFAULT_MB 32768
 #define KV_EXT_TOOL_MAP (1u << 0)
 #define KV_TOOL_MAP_MAGIC0 'K'
 #define KV_TOOL_MAP_MAGIC1 'T'
@@ -5469,8 +5469,18 @@ static int kv_cache_try_load_tokens(server *s, const ds4_tokens *prompt, char **
     if (!kc->enabled) return 0;
     const int quant_bits = ds4_engine_routed_quant_bits(s->engine);
     if (quant_bits != 2 && quant_bits != 4) return 0;
+    const double find_t0 = now_sec();
     int idx = kv_cache_find_prefix(kc, prompt, quant_bits, ds4_session_ctx(s->session));
-    if (idx < 0) return 0;
+    const double find_ms = (now_sec() - find_t0) * 1000.0;
+    if (idx < 0) {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: kv cache miss prompt_tokens=%d entries=%d quant=%d scan=%.1f ms",
+                   prompt->len,
+                   kc->len,
+                   quant_bits,
+                   find_ms);
+        return 0;
+    }
 
     kv_entry e = kc->entry[idx];
     char *path = xstrdup(e.path);
@@ -7046,7 +7056,7 @@ static void usage(FILE *fp) {
         "  --kv-disk-dir DIR\n"
         "      Enable disk KV checkpoints in DIR. The directory is created if needed.\n"
         "  --kv-disk-space-mb N\n"
-        "      Disk budget for checkpoint files. Default when enabled: 4096\n"
+        "      Disk budget for checkpoint files. Default when enabled: 32768\n"
         "  --kv-cache-min-tokens N\n"
         "      Do not save or load checkpoints shorter than N tokens. Default: 512\n"
         "  --kv-cache-cold-max-tokens N\n"
@@ -7071,7 +7081,7 @@ static void usage(FILE *fp) {
         "      shutdown   save the live conversation when the server exits cleanly\n"
         "\n"
         "Normal server command:\n"
-        "  ./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192\n"
+        "  DS4_METAL_PREFILL_CHUNK=4096 ./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 32768\n"
         "\n"
         "Notes:\n"
         "  The server is Metal-only. Use /v1/chat/completions, /v1/completions, or /v1/messages.\n"

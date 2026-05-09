@@ -90,6 +90,7 @@ static id<MTLComputePipelineState> g_argsort_merge_f32_i32_desc_pipeline;
 static id<MTLComputePipelineState> g_sum_rows_f32_f32_pipeline;
 static id<MTLComputePipelineState> g_dsv4_topk_mask_pipeline;
 static id<MTLComputePipelineState> g_dsv4_topk_mask_scatter_pipeline;
+static id<MTLComputePipelineState> g_logits_gather_top_k_pipeline;
 static id<MTLComputePipelineState> g_dsv4_indexer_weighted_sum_pipeline;
 static id<MTLComputePipelineState> g_dsv4_indexer_score_one_direct_pipeline;
 static id<MTLComputePipelineState> g_dsv4_compressor_store_one_pipeline;
@@ -3414,6 +3415,22 @@ int ds4_metal_init(void) {
             return 0;
         }
 
+        fn = [library newFunctionWithName:@"kernel_logits_gather_top_k"];
+        if (!fn) {
+            fprintf(stderr, "ds4: Metal kernel_logits_gather_top_k function not found\n");
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+        g_logits_gather_top_k_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        if (!g_logits_gather_top_k_pipeline) {
+            fprintf(stderr, "ds4: Metal kernel_logits_gather_top_k pipeline failed: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+
         fn = [library newFunctionWithName:@"kernel_dsv4_indexer_weighted_sum"];
         if (!fn) {
             fprintf(stderr, "ds4: Metal kernel_dsv4_indexer_weighted_sum function not found\n");
@@ -3986,6 +4003,7 @@ void ds4_metal_cleanup(void) {
         g_sum_rows_f32_f32_pipeline = nil;
         g_dsv4_topk_mask_pipeline = nil;
         g_dsv4_topk_mask_scatter_pipeline = nil;
+        g_logits_gather_top_k_pipeline = nil;
         g_dsv4_indexer_weighted_sum_pipeline = nil;
         g_dsv4_indexer_score_one_direct_pipeline = nil;
         g_dsv4_compressor_store_one_pipeline = nil;
@@ -4820,6 +4838,63 @@ int ds4_metal_indexer_topk_tensor(
         if (!ds4_metal_finish_command_buffer(cb, owned, "indexer top-k")) return 0;
     }
 
+    return 1;
+}
+
+int ds4_metal_logits_top_k_tensor(
+        ds4_metal_tensor       *out_ids,
+        ds4_metal_tensor       *out_vals,
+        const ds4_metal_tensor *logits,
+        uint32_t                n_vocab,
+        uint32_t                top_k) {
+    if (!g_initialized && !ds4_metal_init()) return 0;
+    if (!out_ids || !out_vals || !logits || n_vocab == 0 ||
+        top_k == 0 || top_k > n_vocab) return 0;
+
+    /* Stage 1: argsort logits to get top_k vocab indices.  We reuse the
+     * indexer top-k pipeline since the math is identical. */
+    if (!ds4_metal_indexer_topk_tensor(out_ids, logits, n_vocab, 1, top_k)) return 0;
+
+    /* Stage 2: gather the matching logit values into a compact array.  Both
+     * stages run inside the active command buffer, so the host only pays one
+     * end_commands wait and reads back top_k * 8 bytes. */
+    @autoreleasepool {
+        const uint64_t ids_bytes = (uint64_t)top_k * sizeof(uint32_t);
+        const uint64_t vals_bytes = (uint64_t)top_k * sizeof(float);
+        const uint64_t logits_bytes = (uint64_t)n_vocab * sizeof(float);
+        id<MTLBuffer> idsbuf = ds4_metal_tensor_buffer(out_ids);
+        id<MTLBuffer> valsbuf = ds4_metal_tensor_buffer(out_vals);
+        id<MTLBuffer> logbuf = ds4_metal_tensor_buffer(logits);
+        if (!idsbuf || !valsbuf || !logbuf ||
+            ds4_metal_tensor_bytes(out_ids) < ids_bytes ||
+            ds4_metal_tensor_bytes(out_vals) < vals_bytes ||
+            ds4_metal_tensor_bytes(logits) < logits_bytes) {
+            fprintf(stderr, "ds4: Metal logits top-k received undersized buffers\n");
+            return 0;
+        }
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_metal_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_metal_compute_encoder(cb);
+        [enc setComputePipelineState:g_logits_gather_top_k_pipeline];
+        const uint32_t k = top_k;
+        [enc setBytes:&k length:sizeof(k) atIndex:0];
+        [enc setBuffer:logbuf offset:ds4_metal_tensor_offset(logits) atIndex:1];
+        [enc setBuffer:idsbuf offset:ds4_metal_tensor_offset(out_ids) atIndex:2];
+        [enc setBuffer:valsbuf offset:ds4_metal_tensor_offset(out_vals) atIndex:3];
+
+        NSUInteger max_threads = g_logits_gather_top_k_pipeline.maxTotalThreadsPerThreadgroup;
+        if (max_threads == 0) max_threads = 256;
+        NSUInteger tg = top_k < (uint32_t)max_threads ? (NSUInteger)top_k : max_threads;
+        if (tg == 0) tg = 1;
+        const NSUInteger groups = ((NSUInteger)top_k + tg - 1) / tg;
+        [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        ds4_metal_end_compute_encoder(cb, enc);
+
+        if (!ds4_metal_finish_command_buffer(cb, owned, "logits gather top-k")) return 0;
+    }
     return 1;
 }
 
