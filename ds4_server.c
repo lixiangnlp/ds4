@@ -724,9 +724,17 @@ static tokenizer_cache g_tokenizer_cache = {
     .mu = PTHREAD_MUTEX_INITIALIZER,
 };
 
-static bool tokenizer_cache_disabled(void) {
+static pthread_once_t g_tokenizer_cache_once = PTHREAD_ONCE_INIT;
+static bool g_tokenizer_cache_disabled = false;
+
+static void tokenizer_cache_init_disabled(void) {
     const char *v = getenv("DS4_TOKENIZER_LRU_DISABLE");
-    return v && v[0] && strcmp(v, "0");
+    g_tokenizer_cache_disabled = v && v[0] && strcmp(v, "0");
+}
+
+static bool tokenizer_cache_disabled(void) {
+    pthread_once(&g_tokenizer_cache_once, tokenizer_cache_init_disabled);
+    return g_tokenizer_cache_disabled;
 }
 
 static void tokenizer_cache_entry_free(tokenizer_cache_entry *e) {
@@ -736,7 +744,17 @@ static void tokenizer_cache_entry_free(tokenizer_cache_entry *e) {
 }
 
 static size_t tokenizer_cache_entry_bytes(const char *text, const ds4_tokens *tokens) {
-    return strlen(text ? text : "") + 1u + (size_t)(tokens ? tokens->len : 0) * sizeof(int);
+    /* Mirror what xstrdup(text) + ds4_tokens_copy() will actually allocate:
+     * the NUL terminator on text, plus token_vec_push's geometric growth
+     * (cap starts at 64 and doubles), so the budget can't drift below truth. */
+    const size_t text_bytes = strlen(text ? text : "") + 1u;
+    const int n = tokens ? tokens->len : 0;
+    size_t cap = 0;
+    if (n > 0) {
+        cap = 64;
+        while (cap < (size_t)n) cap *= 2;
+    }
+    return text_bytes + cap * sizeof(int);
 }
 
 static bool tokenizer_cache_get(const char *text, ds4_tokens *out) {

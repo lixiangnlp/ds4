@@ -771,6 +771,13 @@ static int run_logprob_dump(ds4_engine *engine, const cli_config *cfg, const ds4
     for (; generated < max_tokens; generated++) {
         int n = ds4_session_top_logprobs(session, scores, k);
         int token = ds4_session_argmax(session);
+        if (token < 0) {
+            fprintf(stderr, "ds4: argmax failed while dumping logprobs\n");
+            free(scores);
+            fclose(fp);
+            ds4_session_free(session);
+            return 1;
+        }
         if (generated) fputs(",\n", fp);
         fprintf(fp, "    {\"step\":%d,\"selected\":", generated);
         json_write_token(fp, engine, token);

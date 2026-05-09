@@ -16366,6 +16366,7 @@ int ds4_session_eval_sample_cache(ds4_session *s, int token, int sample_top_k,
     {
         snprintf(err, errlen, "Metal top-k decode failed");
         s->checkpoint_valid = false;
+        s->mtp_draft_valid = false;
         ds4_session_mark_compact_logits(s, 0);
         return 1;
     }
