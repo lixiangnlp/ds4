@@ -9033,7 +9033,7 @@ static bool metal_graph_encode_decode_layer(
                                                             DS4_RMS_EPS) != 0;
             if (ok && emit) g->layer_n_index_comp[il]++;
             const uint32_t decode_top_k = metal_graph_decode_indexer_top_k(g);
-            if (ok && g->layer_n_comp[il] > decode_top_k) {
+            if (ok && g->layer_n_index_comp[il] > decode_top_k) {
                 const uint64_t indexer_q_dim = (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM;
                 if (!layer->indexer_attn_q_b ||
                     layer->indexer_attn_q_b->type != DS4_TENSOR_F16 ||
@@ -14447,6 +14447,55 @@ static int sample_top_p_min_p(
     return ids[filtered - 1];
 }
 
+static int sample_sorted_candidates(
+        const int   *ids,
+        const float *vals,
+        int          n,
+        float        temperature,
+        float        top_p,
+        float        min_p,
+        uint64_t    *rng) {
+    if (!ids || !vals || n <= 0) return -1;
+    if (temperature <= 0.0f) return ids[0];
+    if (top_p <= 0.0f || top_p > 1.0f) top_p = 1.0f;
+    if (min_p < 0.0f) min_p = 0.0f;
+
+    float probs[1024];
+    const float max_logit = vals[0];
+    float sum = 0.0f;
+    int finite = 0;
+    for (int i = 0; i < n; i++) {
+        const float v = vals[i];
+        if (!isfinite(v)) {
+            probs[i] = 0.0f;
+            continue;
+        }
+        probs[i] = expf((v - max_logit) / temperature);
+        sum += probs[i];
+        finite++;
+    }
+    if (finite == 0 || sum <= 0.0f || !isfinite(sum)) return ids[0];
+
+    const float min_prob = (probs[0] / sum) * min_p;
+    float filtered_sum = 0.0f;
+    int filtered = 0;
+    for (int i = 0; i < n; i++) {
+        float p = probs[i] / sum;
+        if (i > 0 && p < min_prob) break;
+        filtered_sum += probs[i];
+        filtered++;
+        if (filtered_sum / sum >= top_p) break;
+    }
+    if (filtered <= 0) return ids[0];
+
+    float r = sample_rng_f32(rng) * filtered_sum;
+    for (int i = 0; i < filtered; i++) {
+        r -= probs[i];
+        if (r <= 0.0f) return ids[i];
+    }
+    return ids[filtered - 1];
+}
+
 static void print_top_logits(
         FILE          * fp,
         const char    * label,
@@ -14842,6 +14891,9 @@ struct ds4_session {
     token_vec checkpoint;
     float *logits;
     float *mtp_logits;
+    int sample_topk_ids[1024];
+    float sample_topk_vals[1024];
+    int sample_topk_n;
     int mtp_draft_token;
     uint64_t mtp_probe_total;
     uint64_t mtp_probe_hit;
@@ -14850,8 +14902,15 @@ struct ds4_session {
     uint32_t prefill_cap;
     int ctx_size;
     bool checkpoint_valid;
+    bool logits_valid;
+    bool sample_topk_valid;
     bool mtp_draft_valid;
 };
+
+static void ds4_session_mark_full_logits(ds4_session *s);
+static void ds4_session_mark_compact_logits(ds4_session *s, int n);
+static bool ds4_session_ensure_host_logits(ds4_session *s);
+static int ds4_session_requested_sample_top_k(float temperature, int top_k);
 
 /* =========================================================================
  * Session Snapshot Payloads.
@@ -15205,6 +15264,10 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
         payload_set_err(err, errlen, "failed to synchronize Metal before snapshot");
         return 1;
     }
+    if (!ds4_session_ensure_host_logits(s)) {
+        payload_set_err(err, errlen, "failed to read logits before snapshot");
+        return 1;
+    }
 
     ds4_metal_graph *g = &s->graph;
     const uint32_t raw_live = session_raw_live_rows(g, (uint32_t)s->checkpoint.len);
@@ -15515,6 +15578,7 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         g->layer_n_index_comp[il] = n_index_comp[il];
     }
     s->checkpoint_valid = true;
+    ds4_session_mark_full_logits(s);
     s->mtp_draft_valid = false;
     g->mtp_n_raw = 0;
     return 0;
@@ -15898,6 +15962,46 @@ void ds4_session_free(ds4_session *s) {
     free(s);
 }
 
+static void ds4_session_mark_full_logits(ds4_session *s) {
+    if (!s) return;
+    s->logits_valid = true;
+    s->sample_topk_valid = false;
+    s->sample_topk_n = 0;
+}
+
+static void ds4_session_mark_compact_logits(ds4_session *s, int n) {
+    if (!s) return;
+    s->logits_valid = false;
+    s->sample_topk_valid = n > 0;
+    s->sample_topk_n = n > 0 ? n : 0;
+}
+
+static bool ds4_session_ensure_host_logits(ds4_session *s) {
+    if (!s) return false;
+    if (s->logits_valid) return true;
+#ifdef DS4_NO_METAL
+    return false;
+#else
+    if (ds4_metal_tensor_read(s->graph.logits,
+                              0,
+                              s->logits,
+                              (uint64_t)DS4_N_VOCAB * sizeof(s->logits[0])) == 0)
+    {
+        return false;
+    }
+    ds4_session_mark_full_logits(s);
+    return true;
+#endif
+}
+
+static int ds4_session_requested_sample_top_k(float temperature, int top_k) {
+    if (temperature <= 0.0f) return 1;
+    if (top_k <= 0) return 0;
+    if (top_k > 1024) top_k = 1024;
+    if (top_k > (int)DS4_N_VOCAB) top_k = (int)DS4_N_VOCAB;
+    return top_k;
+}
+
 void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud) {
     if (!s) return;
     s->progress = fn;
@@ -15984,6 +16088,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
             }
             ds4_tokens_copy(&s->checkpoint, prompt);
             s->checkpoint_valid = true;
+            ds4_session_mark_full_logits(s);
             return 0;
         }
 
@@ -15998,6 +16103,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                 return 1;
             }
             token_vec_push(&s->checkpoint, prompt->v[i]);
+            ds4_session_mark_full_logits(s);
         }
         return 0;
     }
@@ -16026,6 +16132,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     }
     ds4_tokens_copy(&s->checkpoint, prompt);
     s->checkpoint_valid = true;
+    ds4_session_mark_full_logits(s);
     s->mtp_draft_valid = false;
     s->graph.mtp_n_raw = 0;
     return 0;
@@ -16109,15 +16216,29 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
 }
 
 int ds4_session_argmax(ds4_session *s) {
+    if (s && s->sample_topk_valid && s->sample_topk_n > 0) return s->sample_topk_ids[0];
+    if (!ds4_session_ensure_host_logits(s)) return -1;
     return sample_argmax(s->logits, DS4_N_VOCAB);
 }
 
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
+    const int sample_top_k = ds4_session_requested_sample_top_k(temperature, top_k);
+    if (s && s->sample_topk_valid && sample_top_k > 0 && s->sample_topk_n >= sample_top_k) {
+        return sample_sorted_candidates(s->sample_topk_ids,
+                                        s->sample_topk_vals,
+                                        sample_top_k,
+                                        temperature,
+                                        top_p,
+                                        min_p,
+                                        rng);
+    }
+    if (!ds4_session_ensure_host_logits(s)) return -1;
     return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k, top_p, min_p, rng);
 }
 
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
     if (!s || !out || k <= 0) return 0;
+    if (!ds4_session_ensure_host_logits(s)) return 0;
     if (k > (int)DS4_N_VOCAB) k = (int)DS4_N_VOCAB;
     for (int i = 0; i < k; i++) {
         out[i].id = -1;
@@ -16190,6 +16311,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         return 1;
     }
     token_vec_push(&s->checkpoint, token);
+    ds4_session_mark_full_logits(s);
     if (mtp_should_draft) {
         int mtp_top = -1;
         if (metal_graph_eval_mtp_draft(&s->graph,
@@ -16213,6 +16335,46 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
 
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
     return ds4_session_eval_internal(s, token, true, err, errlen);
+}
+
+int ds4_session_eval_sample_cache(ds4_session *s, int token, int sample_top_k,
+                                  char *err, size_t errlen) {
+#ifdef DS4_NO_METAL
+    (void)s;
+    (void)token;
+    (void)sample_top_k;
+    snprintf(err, errlen, "Metal support is not compiled in");
+    return 1;
+#else
+    if (!s) {
+        snprintf(err, errlen, "invalid session");
+        return 1;
+    }
+    if (sample_top_k <= 0) return ds4_session_eval(s, token, err, errlen);
+    if (sample_top_k > 1024) sample_top_k = 1024;
+    if (sample_top_k > (int)DS4_N_VOCAB) sample_top_k = (int)DS4_N_VOCAB;
+
+    ds4_engine *e = s->engine;
+    if (!metal_graph_eval_token_raw_swa_topk(&s->graph,
+                                             &e->model,
+                                             &e->weights,
+                                             token,
+                                             (uint32_t)s->checkpoint.len,
+                                             (uint32_t)sample_top_k,
+                                             s->sample_topk_ids,
+                                             s->sample_topk_vals))
+    {
+        snprintf(err, errlen, "Metal top-k decode failed");
+        s->checkpoint_valid = false;
+        ds4_session_mark_compact_logits(s, 0);
+        return 1;
+    }
+    token_vec_push(&s->checkpoint, token);
+    s->checkpoint_valid = true;
+    s->mtp_draft_valid = false;
+    ds4_session_mark_compact_logits(s, sample_top_k);
+    return 0;
+#endif
 }
 
 int ds4_session_eval_argmax_fast(ds4_session *s, int token, int *next_token,
@@ -16245,6 +16407,9 @@ int ds4_session_eval_argmax_fast(ds4_session *s, int token, int *next_token,
     token_vec_push(&s->checkpoint, token);
     s->checkpoint_valid = true;
     s->mtp_draft_valid = false;
+    s->sample_topk_ids[0] = top;
+    s->sample_topk_vals[0] = 0.0f;
+    ds4_session_mark_compact_logits(s, 1);
     *next_token = top;
     return 0;
 #endif
@@ -16813,6 +16978,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             return -1;
         }
         logits_on_host = true;
+        ds4_session_mark_full_logits(s);
     }
     (void)logits_on_host;
     DS4_MTP_KEEP_ACCEPTED(verified);
@@ -16847,6 +17013,9 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
 void ds4_session_invalidate(ds4_session *s) {
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
+    s->logits_valid = false;
+    s->sample_topk_valid = false;
+    s->sample_topk_n = 0;
     s->mtp_draft_valid = false;
 }
 
@@ -16854,6 +17023,9 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     if (pos < 0) pos = 0;
     if (pos > s->checkpoint.len) pos = s->checkpoint.len;
     s->checkpoint.len = pos;
+    s->logits_valid = false;
+    s->sample_topk_valid = false;
+    s->sample_topk_n = 0;
     s->mtp_draft_valid = false;
 }
 

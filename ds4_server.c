@@ -701,6 +701,126 @@ static void request_free(request *r) {
     memset(r, 0, sizeof(*r));
 }
 
+#define TOKENIZER_CACHE_ENTRIES 32
+#define TOKENIZER_CACHE_MAX_BYTES (16u * 1024u * 1024u)
+#define TOKENIZER_CACHE_MAX_ENTRY_BYTES (4u * 1024u * 1024u)
+
+typedef struct {
+    char *text;
+    size_t text_len;
+    ds4_tokens tokens;
+    size_t bytes;
+    uint64_t age;
+} tokenizer_cache_entry;
+
+typedef struct {
+    pthread_mutex_t mu;
+    tokenizer_cache_entry entry[TOKENIZER_CACHE_ENTRIES];
+    size_t bytes;
+    uint64_t clock;
+} tokenizer_cache;
+
+static tokenizer_cache g_tokenizer_cache = {
+    .mu = PTHREAD_MUTEX_INITIALIZER,
+};
+
+static bool tokenizer_cache_disabled(void) {
+    const char *v = getenv("DS4_TOKENIZER_LRU_DISABLE");
+    return v && v[0] && strcmp(v, "0");
+}
+
+static void tokenizer_cache_entry_free(tokenizer_cache_entry *e) {
+    free(e->text);
+    ds4_tokens_free(&e->tokens);
+    memset(e, 0, sizeof(*e));
+}
+
+static size_t tokenizer_cache_entry_bytes(const char *text, const ds4_tokens *tokens) {
+    return strlen(text ? text : "") + 1u + (size_t)(tokens ? tokens->len : 0) * sizeof(int);
+}
+
+static bool tokenizer_cache_get(const char *text, ds4_tokens *out) {
+    if (tokenizer_cache_disabled()) return false;
+    const size_t len = strlen(text ? text : "");
+    pthread_mutex_lock(&g_tokenizer_cache.mu);
+    for (int i = 0; i < TOKENIZER_CACHE_ENTRIES; i++) {
+        tokenizer_cache_entry *e = &g_tokenizer_cache.entry[i];
+        if (!e->text || e->text_len != len || memcmp(e->text, text, len) != 0) continue;
+        ds4_tokens_copy(out, &e->tokens);
+        e->age = ++g_tokenizer_cache.clock;
+        pthread_mutex_unlock(&g_tokenizer_cache.mu);
+        return true;
+    }
+    pthread_mutex_unlock(&g_tokenizer_cache.mu);
+    return false;
+}
+
+static void tokenizer_cache_put(const char *text, const ds4_tokens *tokens) {
+    if (tokenizer_cache_disabled() || !text || !tokens) return;
+    const size_t bytes = tokenizer_cache_entry_bytes(text, tokens);
+    if (bytes == 0 || bytes > TOKENIZER_CACHE_MAX_ENTRY_BYTES) return;
+
+    pthread_mutex_lock(&g_tokenizer_cache.mu);
+    int slot = -1;
+    for (int i = 0; i < TOKENIZER_CACHE_ENTRIES; i++) {
+        tokenizer_cache_entry *e = &g_tokenizer_cache.entry[i];
+        if (!e->text) {
+            slot = i;
+            break;
+        }
+        if (e->text_len == strlen(text) && strcmp(e->text, text) == 0) {
+            slot = i;
+            break;
+        }
+    }
+    while (slot < 0 || g_tokenizer_cache.bytes + bytes > TOKENIZER_CACHE_MAX_BYTES) {
+        int victim = -1;
+        uint64_t oldest = UINT64_MAX;
+        for (int i = 0; i < TOKENIZER_CACHE_ENTRIES; i++) {
+            tokenizer_cache_entry *e = &g_tokenizer_cache.entry[i];
+            if (e->text && e->age < oldest) {
+                oldest = e->age;
+                victim = i;
+            }
+        }
+        if (victim < 0) break;
+        if (slot < 0) slot = victim;
+        g_tokenizer_cache.bytes -= g_tokenizer_cache.entry[victim].bytes;
+        tokenizer_cache_entry_free(&g_tokenizer_cache.entry[victim]);
+        if (g_tokenizer_cache.bytes + bytes <= TOKENIZER_CACHE_MAX_BYTES) break;
+    }
+    if (slot >= 0) {
+        tokenizer_cache_entry *e = &g_tokenizer_cache.entry[slot];
+        if (e->text) {
+            g_tokenizer_cache.bytes -= e->bytes;
+            tokenizer_cache_entry_free(e);
+        }
+        e->text = xstrdup(text);
+        e->text_len = strlen(text);
+        ds4_tokens_copy(&e->tokens, tokens);
+        e->bytes = bytes;
+        e->age = ++g_tokenizer_cache.clock;
+        g_tokenizer_cache.bytes += bytes;
+    }
+    pthread_mutex_unlock(&g_tokenizer_cache.mu);
+}
+
+static void tokenizer_cache_clear(void) {
+    pthread_mutex_lock(&g_tokenizer_cache.mu);
+    for (int i = 0; i < TOKENIZER_CACHE_ENTRIES; i++) {
+        tokenizer_cache_entry_free(&g_tokenizer_cache.entry[i]);
+    }
+    g_tokenizer_cache.bytes = 0;
+    g_tokenizer_cache.clock = 0;
+    pthread_mutex_unlock(&g_tokenizer_cache.mu);
+}
+
+static void tokenize_rendered_chat_cached(ds4_engine *e, const char *text, ds4_tokens *out) {
+    if (tokenizer_cache_get(text, out)) return;
+    ds4_tokenize_rendered_chat(e, text, out);
+    tokenizer_cache_put(text, out);
+}
+
 static ds4_think_mode think_mode_from_enabled(bool enabled, ds4_think_mode effort) {
     if (!enabled) return DS4_THINK_NONE;
     return effort == DS4_THINK_MAX ? DS4_THINK_MAX : DS4_THINK_HIGH;
@@ -2126,7 +2246,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     r->prompt_text = render_chat_prompt_text(&msgs, r->has_tools ? tool_schemas : NULL,
                                              &r->tool_orders, r->think_mode);
-    ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+    tokenize_rendered_chat_cached(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
     free(tool_schemas);
     return true;
@@ -2321,7 +2441,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     r->prompt_text = render_chat_prompt_text(&msgs, r->has_tools ? tool_schemas : NULL,
                                              &r->tool_orders, r->think_mode);
-    ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+    tokenize_rendered_chat_cached(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
     free(system);
     free(tool_schemas);
@@ -2496,7 +2616,7 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
     buf_puts(&rendered, "<｜Assistant｜>");
     buf_puts(&rendered, ds4_think_mode_enabled(r->think_mode) ? "<think>" : "</think>");
     r->prompt_text = buf_take(&rendered);
-    ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+    tokenize_rendered_chat_cached(e, r->prompt_text, &r->prompt);
     free(prompt);
     return true;
 bad:
@@ -6270,6 +6390,11 @@ static void generate_job(server *s, job *j) {
         }
         if (in_tool_call) temperature = 0.0f;
         int token = ds4_session_sample(s->session, temperature, top_k, top_p, min_p, &rng);
+        if (token < 0) {
+            finish = "error";
+            snprintf(err, sizeof(err), "sampling failed");
+            break;
+        }
         if (token == ds4_token_eos(s->engine)) {
             finish = "stop";
             break;
@@ -6294,7 +6419,13 @@ static void generate_job(server *s, job *j) {
                 break;
             }
         } else {
-            if (ds4_session_eval(s->session, token, err, sizeof(err)) != 0) {
+            int sample_cache_k = 0;
+            if (temperature <= 0.0f) {
+                sample_cache_k = 1;
+            } else if (top_k > 0) {
+                sample_cache_k = top_k > 1024 ? 1024 : top_k;
+            }
+            if (ds4_session_eval_sample_cache(s->session, token, sample_cache_k, err, sizeof(err)) != 0) {
                 finish = "error";
                 break;
             }
@@ -7003,6 +7134,7 @@ static void server_close_resources(server *s) {
     kv_cache_close(&s->kv);
     tool_memory_free(&s->tool_mem);
     pthread_mutex_destroy(&s->tool_mu);
+    tokenizer_cache_clear();
     pthread_mutex_destroy(&s->trace_mu);
     pthread_cond_destroy(&s->clients_cv);
     pthread_cond_destroy(&s->cv);

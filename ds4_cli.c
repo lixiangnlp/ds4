@@ -566,6 +566,11 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
     while (generated < max_tokens && !cli_interrupt_requested()) {
         int token = gpu_top1 ? fast_next :
             ds4_session_sample(session, cfg->gen.temperature, 0, cfg->gen.top_p, 0.0f, &rng);
+        if (token < 0) {
+            fprintf(stderr, "ds4: sampling failed\n");
+            ds4_session_free(session);
+            return 1;
+        }
         if (token == ds4_token_eos(engine)) break;
 
         int toks[17];
@@ -594,7 +599,8 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
                 return 1;
             }
         } else {
-            if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
+            const int sample_cache_k = cfg->gen.temperature <= 0.0f ? 1 : 0;
+            if (ds4_session_eval_sample_cache(session, token, sample_cache_k, err, sizeof(err)) != 0) {
                 fprintf(stderr, "ds4: decode failed: %s\n", err);
                 ds4_session_free(session);
                 return 1;
@@ -1052,6 +1058,10 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
                                        cfg->gen.top_p,
                                        0.0f,
                                        &rng);
+        if (token < 0) {
+            fprintf(stderr, "ds4: sampling failed\n");
+            return 1;
+        }
         if (token == ds4_token_eos(engine)) break;
 
         int toks[17];
@@ -1071,7 +1081,8 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
                 return 1;
             }
         } else {
-            if (ds4_session_eval(chat->session, token, err, sizeof(err)) != 0) {
+            const int sample_cache_k = cfg->gen.temperature <= 0.0f ? 1 : 0;
+            if (ds4_session_eval_sample_cache(chat->session, token, sample_cache_k, err, sizeof(err)) != 0) {
                 fprintf(stderr, "ds4: decode failed: %s\n", err);
                 return 1;
             }
