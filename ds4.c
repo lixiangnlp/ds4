@@ -38,6 +38,7 @@
 
 #include "ds4.h"
 #include "ds4_distributed.h"
+#include "ds4_flashmem.h"
 
 #ifndef DS4_NO_GPU
 #include "ds4_gpu.h"
@@ -10282,6 +10283,28 @@ typedef struct {
     ds4_gpu_tensor *indexer_scores;
     ds4_gpu_tensor *comp_mask;
     ds4_gpu_tensor *comp_selected;
+
+    /* FlashMemory lookahead retriever state (fm == NULL when --flashmem is
+     * off; no field below is touched in that case).  The retriever consumes
+     * the final-norm hidden state (the lm_head input, as in the published
+     * reference loop), so a trigger only needs output_norm of the completed
+     * token.  Compressed chunks are time-aligned across ratio-4 layers, so
+     * the recall set is one global chunk-id bitmap shared by every layer's
+     * indexer.  Chunks at ids >= fm_scored_chunks postdate the last trigger
+     * and are implicitly resident. */
+    const ds4_flashmem *fm;
+    ds4_gpu_tensor *fm_q;
+    ds4_gpu_tensor *fm_w;
+    ds4_gpu_tensor *fm_resident_bits;
+    float *fm_q_host;
+    float *fm_w_host;
+    float *fm_score_max;
+    float *fm_select_scratch;
+    uint32_t *fm_bits_host;
+    uint32_t fm_scored_chunks;
+    uint32_t fm_resident_chunks;
+    uint32_t fm_last_trigger_pos;
+    bool fm_bitmap_live;
     ds4_gpu_tensor *heads;
     ds4_gpu_tensor *attn_low;
     ds4_gpu_tensor *attn_out;
@@ -10567,12 +10590,212 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->hc_mix);
     ds4_gpu_tensor_free(g->flat_hc);
     ds4_gpu_tensor_free(g->cur_hc);
+    ds4_gpu_tensor_free(g->fm_q);
+    ds4_gpu_tensor_free(g->fm_w);
+    ds4_gpu_tensor_free(g->fm_resident_bits);
+    free(g->fm_q_host);
+    free(g->fm_w_host);
+    free(g->fm_score_max);
+    free(g->fm_select_scratch);
+    free(g->fm_bits_host);
     free(g->cpu_router_norm);
     memset(g, 0, sizeof(*g));
 }
 
 static bool metal_tensor_fill_f32(ds4_gpu_tensor *t, float v, uint64_t n) {
     return ds4_gpu_tensor_fill_f32(t, v, n) != 0;
+}
+
+/* =========================================================================
+ * FlashMemory Lookahead Gating.
+ * =========================================================================
+ *
+ * Opt-in port of FlashMemory-DeepSeek-V4 (arXiv 2606.09079).  Every tau
+ * decode steps the retriever scores the full compressed-chunk history of its
+ * three host layers against the current hidden state and predicts which
+ * chunks the next tau tokens will need.  The native ratio-4 indexer then
+ * scans only the resident chunks instead of the whole history, which is what
+ * makes million-token decode bandwidth-bound on ~13% of the indexer keys
+ * instead of all of them, and leaves cold cache pages untouched for the OS
+ * to reclaim.  Prefill is never gated, and until the first trigger (or after
+ * any cache rewind) the bitmap is dead and decode behaves exactly as without
+ * FlashMemory.
+ */
+
+/* Ratio-4 chunk emission is position-driven and identical across layers, so
+ * any retriever host layer's count is the global chunk count. */
+static uint32_t metal_graph_flashmem_chunks(const ds4_gpu_graph *g) {
+    return g->layer_n_index_comp[g->fm->layer[0].layer_id];
+}
+
+/* Drop gating until the next trigger.  Required whenever chunk counters are
+ * rewound or restored: the bitmap indexes chunk ids of a cache state that no
+ * longer exists. */
+static void metal_graph_flashmem_invalidate(ds4_gpu_graph *g) {
+    if (!g->fm) return;
+    g->fm_scored_chunks = 0;
+    g->fm_resident_chunks = 0;
+    g->fm_bitmap_live = false;
+}
+
+static bool metal_graph_flashmem_init(ds4_gpu_graph *g, const ds4_flashmem *fm) {
+    if (!fm) return true;
+    for (uint32_t li = 0; li < fm->n_layers; li++) {
+        if (fm->layer[li].layer_id >= DS4_N_LAYER ||
+            ds4_layer_compress_ratio(fm->layer[li].layer_id) != 4) {
+            fprintf(stderr,
+                    "ds4: FlashMemory retriever layer %u is not a ratio-4 layer\n",
+                    fm->layer[li].layer_id);
+            return false;
+        }
+    }
+    if (fm->n_embd != DS4_N_EMBD || fm->head_dim != DS4_N_INDEXER_HEAD_DIM) {
+        fprintf(stderr, "ds4: FlashMemory weights do not match the model shape\n");
+        return false;
+    }
+
+    g->fm = fm;
+    const uint64_t q_bytes = (uint64_t)fm->n_heads * fm->head_dim * sizeof(float);
+    const uint64_t bit_words = ((uint64_t)g->comp_cap + 31u) / 32u;
+    bool ok = true;
+    g->fm_q = ds4_gpu_tensor_alloc(q_bytes);
+    g->fm_w = ds4_gpu_tensor_alloc((uint64_t)fm->n_heads * sizeof(float));
+    g->fm_resident_bits = ds4_gpu_tensor_alloc(bit_words * sizeof(uint32_t));
+    g->fm_q_host = xmalloc(q_bytes);
+    g->fm_w_host = xmalloc((size_t)fm->n_heads * sizeof(float));
+    g->fm_score_max = xmalloc((size_t)g->comp_cap * sizeof(float));
+    g->fm_select_scratch = xmalloc((size_t)g->comp_cap * sizeof(float));
+    g->fm_bits_host = xmalloc((size_t)bit_words * sizeof(uint32_t));
+    ok = ok && g->fm_q && g->fm_w && g->fm_resident_bits;
+    metal_graph_flashmem_invalidate(g);
+    if (!ok) fprintf(stderr, "ds4: failed to allocate FlashMemory graph state\n");
+    return ok;
+}
+
+/* Refresh the resident-chunk bitmap.  Runs at the end of a decode token,
+ * after its command buffers completed, every tau decode steps: the token's
+ * final-norm hidden state (the lm_head input, already materialized for the
+ * logits read) is the retriever query for all host layers, exactly like the
+ * published reference decode loop.  The refreshed bitmap gates the native
+ * indexer from the next token on. */
+static bool metal_graph_flashmem_update(ds4_gpu_graph *g, uint32_t pos) {
+    if (!g->fm) return true;
+    const ds4_flashmem *fm = g->fm;
+
+    const uint32_t chunks = metal_graph_flashmem_chunks(g);
+    if (chunks < DS4_FLASHMEM_MIN_CHUNKS) return true;
+    if (g->fm_bitmap_live &&
+        pos - g->fm_last_trigger_pos < DS4_FLASHMEM_TAU) {
+        return true;
+    }
+    const float *hidden = ds4_gpu_tensor_contents(g->output_norm);
+    if (!hidden) return false;
+
+    const uint32_t bit_words = (chunks + 31u) / 32u;
+    memset(g->fm_bits_host, 0, (size_t)bit_words * sizeof(uint32_t));
+
+    /* DS4_FLASHMEM_LAYERS=12,20 restricts the ensemble to a subset of
+     * retriever layers; diagnostic while calibrating the released
+     * checkpoint's per-layer ranking quality. */
+    const char *layer_filter = getenv("DS4_FLASHMEM_LAYERS");
+    bool ensemble_seeded = false;
+
+    const double t0 = now_sec();
+    for (uint32_t li = 0; li < fm->n_layers; li++) {
+        const uint32_t il = fm->layer[li].layer_id;
+        if (layer_filter && layer_filter[0]) {
+            char needle[16];
+            snprintf(needle, sizeof(needle), ",%u,", il);
+            char hay[128];
+            snprintf(hay, sizeof(hay), ",%s,", layer_filter);
+            if (!strstr(hay, needle)) continue;
+        }
+        ds4_flashmem_build_query(fm, li, hidden, pos, g->fm_q_host, g->fm_w_host);
+        if (ds4_gpu_tensor_write(g->fm_q, 0, g->fm_q_host,
+                                 (uint64_t)fm->n_heads * fm->head_dim * sizeof(float)) == 0 ||
+            ds4_gpu_tensor_write(g->fm_w, 0, g->fm_w_host,
+                                 (uint64_t)fm->n_heads * sizeof(float)) == 0 ||
+            ds4_gpu_indexer_score_one_tensor(g->indexer_scores, g->fm_q, g->fm_w,
+                                             g->layer_index_comp_cache[il], chunks,
+                                             fm->n_heads, fm->head_dim,
+                                             fm->score_scale) == 0) {
+            return false;
+        }
+        const float *scores = ds4_gpu_tensor_contents(g->indexer_scores);
+        if (!scores) return false;
+        /* Cross-layer max ensemble: a chunk's lookahead score is the best
+         * logit any retriever layer gives it. */
+        if (!ensemble_seeded) {
+            memcpy(g->fm_score_max, scores, (size_t)chunks * sizeof(float));
+            ensemble_seeded = true;
+        } else {
+            for (uint32_t c = 0; c < chunks; c++) {
+                if (scores[c] > g->fm_score_max[c]) g->fm_score_max[c] = scores[c];
+            }
+        }
+        if (getenv("DS4_FLASHMEM_DEBUG")) {
+            float lo = scores[0], hi = scores[0];
+            double sum = 0.0;
+            for (uint32_t c = 0; c < chunks; c++) {
+                if (scores[c] < lo) lo = scores[c];
+                if (scores[c] > hi) hi = scores[c];
+                sum += scores[c];
+            }
+            fprintf(stderr,
+                    "ds4: flashmem layer %u logits min %.3f mean %.3f max %.3f\n",
+                    il, lo, sum / chunks, hi);
+        }
+    }
+
+    /* Keep the top eighth of the history by ensembled score (with a floor),
+     * plus the recent window.  The cutoff is the k-th largest score; ties at
+     * the cutoff keep a few extra chunks, which only errs toward recall.
+     * DS4_FLASHMEM_KEEP_SHIFT / DS4_FLASHMEM_KEEP_FLOOR override the budget
+     * for recall/memory tuning. */
+    uint32_t keep_shift = DS4_FLASHMEM_KEEP_SHIFT;
+    uint32_t keep_floor = DS4_FLASHMEM_KEEP_FLOOR;
+    const char *env_shift = getenv("DS4_FLASHMEM_KEEP_SHIFT");
+    const char *env_floor = getenv("DS4_FLASHMEM_KEEP_FLOOR");
+    if (env_shift && env_shift[0]) keep_shift = (uint32_t)atoi(env_shift);
+    if (env_floor && env_floor[0]) keep_floor = (uint32_t)atoi(env_floor);
+    uint32_t keep = keep_shift < 32 ? chunks >> keep_shift : 0u;
+    if (keep < keep_floor) keep = keep_floor;
+    if (keep > chunks) keep = chunks;
+    const float cutoff =
+        ds4_flashmem_kth_largest(g->fm_select_scratch, g->fm_score_max,
+                                 chunks, keep);
+    for (uint32_t c = 0; c < chunks; c++) {
+        if (g->fm_score_max[c] >= cutoff) {
+            g->fm_bits_host[c >> 5] |= 1u << (c & 31u);
+        }
+    }
+    const uint32_t recent_lo = chunks > DS4_FLASHMEM_RECENT_CHUNKS
+        ? chunks - DS4_FLASHMEM_RECENT_CHUNKS : 0u;
+    for (uint32_t c = recent_lo; c < chunks; c++) {
+        g->fm_bits_host[c >> 5] |= 1u << (c & 31u);
+    }
+
+    uint32_t resident = 0;
+    for (uint32_t wd = 0; wd < bit_words; wd++) {
+        resident += (uint32_t)__builtin_popcount(g->fm_bits_host[wd]);
+    }
+    if (ds4_gpu_tensor_write(g->fm_resident_bits, 0, g->fm_bits_host,
+                             (uint64_t)bit_words * sizeof(uint32_t)) == 0) {
+        return false;
+    }
+
+    g->fm_scored_chunks = chunks;
+    g->fm_resident_chunks = resident;
+    g->fm_last_trigger_pos = pos;
+    g->fm_bitmap_live = true;
+    if (getenv("DS4_FLASHMEM_DEBUG")) {
+        fprintf(stderr,
+                "ds4: flashmem trigger pos=%u resident %u/%u chunks (%.1f%%) %.1f ms\n",
+                pos, resident, chunks,
+                100.0 * (double)resident / (double)chunks,
+                (now_sec() - t0) * 1000.0);
+    }
+    return true;
 }
 
 /* =========================================================================
@@ -14540,14 +14763,32 @@ static bool metal_graph_encode_decode_layer(
                                                                     g->layer_n_index_comp[il],
                                                                     &decode_index_stage_t0);
                 }
-                if (ok) ok = ds4_gpu_indexer_score_one_tensor(g->indexer_scores,
-                                                                g->indexer_q,
-                                                                g->indexer_weights,
-                                                                g->layer_index_comp_cache[il],
-                                                                g->layer_n_index_comp[il],
-                                                                DS4_N_INDEXER_HEAD,
-                                                                DS4_N_INDEXER_HEAD_DIM,
-                                                                index_scale) != 0;
+                if (ok && g->fm_bitmap_live) {
+                    /* FlashMemory gating: score only the chunks the
+                     * retriever predicted (plus everything newer than the
+                     * last trigger); cold chunks never load their keys and
+                     * surface as -inf, so the top-k below sees only the
+                     * resident candidate set. */
+                    ok = ds4_gpu_indexer_score_one_masked_tensor(g->indexer_scores,
+                                                                   g->indexer_q,
+                                                                   g->indexer_weights,
+                                                                   g->layer_index_comp_cache[il],
+                                                                   g->fm_resident_bits,
+                                                                   g->fm_scored_chunks,
+                                                                   g->layer_n_index_comp[il],
+                                                                   DS4_N_INDEXER_HEAD,
+                                                                   DS4_N_INDEXER_HEAD_DIM,
+                                                                   index_scale) != 0;
+                } else if (ok) {
+                    ok = ds4_gpu_indexer_score_one_tensor(g->indexer_scores,
+                                                            g->indexer_q,
+                                                            g->indexer_weights,
+                                                            g->layer_index_comp_cache[il],
+                                                            g->layer_n_index_comp[il],
+                                                            DS4_N_INDEXER_HEAD,
+                                                            DS4_N_INDEXER_HEAD_DIM,
+                                                            index_scale) != 0;
+                }
                 if (ok && decode_index_stage_profile) {
                     ok = metal_graph_indexer_stage_profile_boundary("decode_score",
                                                                     il,
@@ -18588,7 +18829,9 @@ static bool metal_graph_eval_token_raw_swa(
         uint32_t               pos,
         float                 *logits) {
     if (g && g->ssd_streaming) {
-        return metal_graph_eval_token_raw_swa_streaming(g, model, weights, token, pos, logits);
+        bool ok = metal_graph_eval_token_raw_swa_streaming(g, model, weights, token, pos, logits);
+        if (ok && logits) ok = metal_graph_flashmem_update(g, pos);
+        return ok;
     }
 
     const bool profile = getenv("DS4_METAL_GRAPH_TOKEN_PROFILE") != NULL;
@@ -18616,6 +18859,7 @@ static bool metal_graph_eval_token_raw_swa(
                 logits != NULL);
     }
     if (ok) graph_power_note_decode_token(g, t_read - t0);
+    if (ok && logits) ok = metal_graph_flashmem_update(g, pos);
     if (!ok) {
         if (ds4_gpu_synchronize() == 0) {
             fprintf(stderr, "ds4: Metal synchronize after graph eval failure also failed\n");
@@ -20876,6 +21120,7 @@ struct ds4_engine {
     bool ssd_streaming;
     bool ssd_streaming_cold;
     ds4_distributed_options distributed;
+    ds4_flashmem *flashmem;
     bool metal_ready;
     bool mtp_ready;
 };
@@ -22438,6 +22683,8 @@ static uint64_t session_payload_live_tensor_bytes(const ds4_gpu_graph *g, uint32
         bytes += (uint64_t)raw_live * DS4_N_HEAD_DIM * sizeof(float);
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) continue;
+        /* comp span = packed 584 B/row when packed, else f32-canonical (must
+         * match save/restore spans or the checkpoint payload total is wrong). */
         bytes += (uint64_t)g->layer_n_comp[il] *
                  (metal_graph_attn_comp_cache_format() == 2u
                       ? metal_graph_attn_comp_cache_row_bytes()
@@ -22656,8 +22903,6 @@ uint64_t ds4_session_layer_payload_bytes(ds4_session *s,
         bytes += (uint64_t)raw_live * DS4_N_HEAD_DIM * sizeof(float);
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) continue;
-        /* comp span = packed 584 B/row when packed, else f32-canonical (must
-         * match save/restore spans or the checkpoint payload total is wrong). */
         bytes += (uint64_t)g->layer_n_comp[il] *
                  (metal_graph_attn_comp_cache_format() == 2u
                       ? metal_graph_attn_comp_cache_row_bytes()
@@ -23048,6 +23293,7 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
             g->layer_n_comp[il] = n_comp[i];
             g->layer_n_index_comp[il] = n_index_comp[i];
         }
+        metal_graph_flashmem_invalidate(g);
         s->checkpoint_valid = true;
         s->mtp_draft_valid = false;
         g->mtp_n_raw = 0;
@@ -23134,6 +23380,7 @@ static bool spec_frontier_snapshot(ds4_spec_frontier *f, ds4_session *s) {
 static bool spec_frontier_restore(ds4_spec_frontier *f, ds4_session *s) {
     ds4_gpu_graph *g = &s->graph;
     bool ok = ds4_gpu_begin_commands() != 0;
+    metal_graph_flashmem_invalidate(g);
     g->mtp_n_raw = f->mtp_n_raw;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         g->layer_n_comp[il] = f->n_comp[il];
@@ -23169,6 +23416,7 @@ static bool spec_frontier_restore(ds4_spec_frontier *f, ds4_session *s) {
 static bool spec_frontier_commit_prefix1(ds4_session *s) {
     ds4_gpu_graph *g = &s->graph;
     bool ok = ds4_gpu_begin_commands() != 0;
+    metal_graph_flashmem_invalidate(g);
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) continue;
@@ -23890,6 +24138,7 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         g->layer_n_comp[il] = n_comp[il];
         g->layer_n_index_comp[il] = n_index_comp[il];
     }
+    metal_graph_flashmem_invalidate(g);
     s->checkpoint_valid = true;
     s->mtp_draft_valid = false;
     g->mtp_n_raw = 0;
@@ -24621,6 +24870,33 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         e->directional_steering_attn_scale = opt->directional_steering_attn;
         e->directional_steering_ffn_scale = opt->directional_steering_ffn;
     }
+    if (opt->flashmem_path && opt->flashmem_path[0]) {
+        if (opt->backend != DS4_BACKEND_METAL) {
+            fprintf(stderr, "ds4: --flashmem is currently supported only with --metal\n");
+            free(e);
+            *out = NULL;
+            return 1;
+        }
+        if (opt->mtp_path && opt->mtp_path[0]) {
+            fprintf(stderr, "ds4: --flashmem cannot be combined with --mtp yet\n");
+            free(e);
+            *out = NULL;
+            return 1;
+        }
+        char fm_err[256] = "";
+        e->flashmem = ds4_flashmem_load(opt->flashmem_path, fm_err, sizeof(fm_err));
+        if (!e->flashmem) {
+            fprintf(stderr, "ds4: --flashmem %s: %s\n", opt->flashmem_path, fm_err);
+            free(e);
+            *out = NULL;
+            return 1;
+        }
+        fprintf(stderr,
+                "ds4: FlashMemory lookahead gating enabled: %u retriever layers, "
+                "%u heads, tau=%d, recent window %d chunks\n",
+                e->flashmem->n_layers, e->flashmem->n_heads,
+                DS4_FLASHMEM_TAU, DS4_FLASHMEM_RECENT_CHUNKS);
+    }
     if (opt->n_threads > 0) g_requested_threads = (uint32_t)opt->n_threads;
     ds4_acquire_instance_lock();
 
@@ -25042,6 +25318,7 @@ void ds4_engine_close(ds4_engine *e) {
 #endif
     ds4_ssd_memory_lock_release(&e->simulated_memory);
     ds4_release_instance_lock();
+    ds4_flashmem_free(e->flashmem);
     free(e->directional_steering_dirs);
     free(e->directional_steering_file);
     free(e);
@@ -25093,6 +25370,11 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     s->graph.ssd_streaming_cold = e->ssd_streaming_cold;
     s->graph.streaming_preload_experts = e->ssd_streaming_preload_experts;
     s->graph.power_percent = (uint32_t)e->power_percent;
+    if (!metal_graph_flashmem_init(&s->graph, e->flashmem)) {
+        metal_graph_free(&s->graph);
+        free(s);
+        return 1;
+    }
     if (!metal_graph_load_directional_steering(&s->graph,
                                                e->directional_steering_file,
                                                e->directional_steering_attn_scale,

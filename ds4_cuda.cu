@@ -5988,6 +5988,26 @@ extern "C" int ds4_gpu_indexer_score_one_tensor(
                                  n_head, head_dim, 1, scale, 0);
 }
 
+/* FlashMemory gating is Metal-only for now; ds4_engine_open() refuses
+ * --flashmem on this backend, so this stub only satisfies the linker. */
+extern "C" int ds4_gpu_indexer_score_one_masked_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *index_comp,
+        const ds4_gpu_tensor *resident_bits,
+        uint32_t                scored_chunks,
+        uint32_t                n_comp,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        float                   scale) {
+    (void)scores; (void)q; (void)weights; (void)index_comp;
+    (void)resident_bits; (void)scored_chunks; (void)n_comp;
+    (void)n_head; (void)head_dim; (void)scale;
+    fprintf(stderr, DS4_GPU_LOG_PREFIX "masked indexer score is not implemented\n");
+    return 0;
+}
+
 extern "C" int ds4_gpu_indexer_scores_prefill_tensor(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,

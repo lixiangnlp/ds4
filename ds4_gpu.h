@@ -145,6 +145,22 @@ int ds4_gpu_indexer_score_one_tensor(
         uint32_t                head_dim,
         float                   scale);
 
+/* FlashMemory-gated decode indexer scoring.  Rows below scored_chunks whose
+ * bit is clear in the resident bitmap never load their key and score -inf;
+ * rows at or above scored_chunks postdate the last retriever trigger and are
+ * scored normally.  Decode-only (n_head 64, head_dim 128). */
+int ds4_gpu_indexer_score_one_masked_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *index_comp,
+        const ds4_gpu_tensor *resident_bits,
+        uint32_t                scored_chunks,
+        uint32_t                n_comp,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        float                   scale);
+
 int ds4_gpu_indexer_scores_prefill_tensor(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,

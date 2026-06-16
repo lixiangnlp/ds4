@@ -100,6 +100,7 @@ typedef struct {
     int mtp_draft_tokens;
     float mtp_margin;
     const char *directional_steering_file;
+    const char *flashmem_path;
     const char *expert_profile_path;
     float directional_steering_attn;
     float directional_steering_ffn;

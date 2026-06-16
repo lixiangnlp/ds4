@@ -176,6 +176,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
             opt(fp, c, "--mtp-draft N", "Maximum autoregressive MTP draft tokens. Default: 1");
             opt(fp, c, "--mtp-margin F", "Verifier confidence margin for fast MTP acceptance. Default: 3");
         }
+        opt(fp, c, "--flashmem FILE", "FlashMemory lookahead retriever weights; gates the ratio-4 indexer to predicted compressed chunks during long decodes (Metal only).");
         opt(fp, c, "--quality", "Prefer exact kernels where faster approximate paths exist.");
         opt(fp, c, "--warm-weights", "Touch mapped tensor pages at startup to reduce first-use stalls.");
         if (tool == DS4_HELP_DS4 || tool == DS4_HELP_BENCH) {

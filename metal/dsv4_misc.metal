@@ -83,6 +83,11 @@ struct ds4_metal_args_dsv4_indexer_scores_fused {
     float    scale;
 };
 
+struct ds4_metal_args_dsv4_indexer_scores_masked {
+    struct ds4_metal_args_dsv4_indexer_scores_fused fused;
+    uint32_t scored_chunks;
+};
+
 struct ds4_metal_args_dsv4_router_select_one {
     uint32_t has_bias;
     uint32_t hash_mode;
@@ -153,6 +158,79 @@ kernel void kernel_dsv4_indexer_score_one_direct(
         ushort lane [[thread_index_in_simdgroup]],
         ushort sg [[simdgroup_index_in_threadgroup]]) {
     if (row >= args.n_comp || args.n_head != 64u || args.head_dim != 128u) {
+        return;
+    }
+
+    threadgroup float *ktg = shared;        // [128]
+    threadgroup float *psum = ktg + 128u;   // [4]
+
+    if (tid < 128u) {
+        device const float *krow = (device const float *)(index_comp +
+            (uint64_t)row * args.index_row_stride);
+        ktg[tid] = krow[tid];
+    }
+
+    float acc = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint head0 = 0; head0 < 64u; head0 += 4u) {
+        const uint head = head0 + (uint)sg;
+        device const float4 *q4 = (device const float4 *)(q +
+            (uint64_t)head * args.q_head_stride);
+        threadgroup const float4 *k4 = (threadgroup const float4 *)ktg;
+
+        float s = dot(q4[lane], k4[lane]);
+        s = simd_sum(s);
+        if (lane == 0) {
+            device const float *w = (device const float *)weights;
+            psum[sg] = max(s, 0.0f) * (w[head] * args.scale);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) {
+            acc += psum[0];
+            acc += psum[1];
+            acc += psum[2];
+            acc += psum[3];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) {
+        device float *dst = (device float *)scores;
+        dst[row] = acc;
+    }
+}
+
+// FlashMemory-gated variant of the direct decode indexer score builder.
+// Rows below scored_chunks with a clear residency bit are cold compressed
+// chunks: their 128-wide key is never loaded and the score is forced to
+// -inf so the following top-k only sees retriever-resident rows.  Rows at or
+// above scored_chunks were appended after the last retriever trigger and
+// score normally.  The hot loop is otherwise identical to
+// kernel_dsv4_indexer_score_one_direct.
+kernel void kernel_dsv4_indexer_score_one_direct_masked(
+        constant ds4_metal_args_dsv4_indexer_scores_masked & margs,
+        device const char *q,
+        device const char *weights,
+        device const char *index_comp,
+        device const uint *resident_bits,
+        device       char *scores,
+        threadgroup float *shared [[threadgroup(0)]],
+        uint row [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    constant ds4_metal_args_dsv4_indexer_scores_fused & args = margs.fused;
+    if (row >= args.n_comp || args.n_head != 64u || args.head_dim != 128u) {
+        return;
+    }
+
+    if (row < margs.scored_chunks &&
+        ((resident_bits[row >> 5] >> (row & 31u)) & 1u) == 0u) {
+        if (tid == 0) {
+            device float *dst = (device float *)scores;
+            dst[row] = -INFINITY;
+        }
         return;
     }
 

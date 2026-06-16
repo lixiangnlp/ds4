@@ -133,6 +133,7 @@ static id<MTLComputePipelineState> g_dsv4_topk_mask_pipeline;
 static id<MTLComputePipelineState> g_dsv4_topk_mask_scatter_pipeline;
 static id<MTLComputePipelineState> g_dsv4_indexer_weighted_sum_pipeline;
 static id<MTLComputePipelineState> g_dsv4_indexer_score_one_direct_pipeline;
+static id<MTLComputePipelineState> g_dsv4_indexer_score_one_direct_masked_pipeline;
 static id<MTLComputePipelineState> g_dsv4_compressor_store_one_pipeline;
 static id<MTLComputePipelineState> g_dsv4_sort_i32_rows_asc_pipeline;
 static id<MTLComputePipelineState> g_dsv4_indexed_attention_heads8_pipeline;
@@ -4497,6 +4498,11 @@ typedef struct {
 } ds4_gpu_dsv4_indexer_scores_fused_args;
 
 typedef struct {
+    ds4_gpu_dsv4_indexer_scores_fused_args fused;
+    uint32_t scored_chunks;
+} ds4_gpu_dsv4_indexer_scores_masked_args;
+
+typedef struct {
     uint32_t width;
     uint32_t rows;
     uint64_t gate_row_stride;
@@ -6815,6 +6821,7 @@ void ds4_gpu_cleanup(void) {
         g_dsv4_topk_mask_scatter_pipeline = nil;
         g_dsv4_indexer_weighted_sum_pipeline = nil;
         g_dsv4_indexer_score_one_direct_pipeline = nil;
+        g_dsv4_indexer_score_one_direct_masked_pipeline = nil;
         g_dsv4_compressor_store_one_pipeline = nil;
         g_dsv4_sort_i32_rows_asc_pipeline = nil;
         g_dsv4_indexed_attention_heads8_pipeline = nil;
@@ -12367,6 +12374,94 @@ int ds4_gpu_indexer_score_one_tensor(
         ds4_gpu_end_compute_encoder(cb, enc);
 
         if (!ds4_gpu_finish_command_buffer(cb, owned, "indexer score")) return 0;
+    }
+
+    return 1;
+}
+
+int ds4_gpu_indexer_score_one_masked_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *index_comp,
+        const ds4_gpu_tensor *resident_bits,
+        uint32_t                scored_chunks,
+        uint32_t                n_comp,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        float                   scale) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!scores || !q || !weights || !index_comp || !resident_bits ||
+        n_comp == 0) {
+        return 0;
+    }
+    if (n_head != 64 || head_dim != 128) {
+        fprintf(stderr, "ds4: masked indexer score supports only the 64x128 decode shape\n");
+        return 0;
+    }
+
+    @autoreleasepool {
+        const uint64_t q_bytes = (uint64_t)n_head * head_dim * sizeof(float);
+        const uint64_t weight_bytes = (uint64_t)n_head * sizeof(float);
+        const uint64_t comp_bytes = (uint64_t)n_comp * head_dim * sizeof(float);
+        const uint64_t score_bytes = (uint64_t)n_comp * sizeof(float);
+        const uint64_t bits_bytes = ((uint64_t)scored_chunks + 31u) / 32u * sizeof(uint32_t);
+        id<MTLBuffer> qbuf = ds4_gpu_tensor_buffer(q);
+        id<MTLBuffer> wbuf = ds4_gpu_tensor_buffer(weights);
+        id<MTLBuffer> compbuf = ds4_gpu_tensor_buffer(index_comp);
+        id<MTLBuffer> bitsbuf = ds4_gpu_tensor_buffer(resident_bits);
+        id<MTLBuffer> scorebuf = ds4_gpu_tensor_buffer(scores);
+        if (!qbuf || !wbuf || !compbuf || !bitsbuf || !scorebuf ||
+            ds4_gpu_tensor_bytes(q) < q_bytes ||
+            ds4_gpu_tensor_bytes(weights) < weight_bytes ||
+            ds4_gpu_tensor_bytes(index_comp) < comp_bytes ||
+            ds4_gpu_tensor_bytes(resident_bits) < bits_bytes ||
+            ds4_gpu_tensor_bytes(scores) < score_bytes) {
+            fprintf(stderr, "ds4: Metal masked indexer score received undersized buffers\n");
+            return 0;
+        }
+
+        if (!g_dsv4_indexer_score_one_direct_masked_pipeline) {
+            g_dsv4_indexer_score_one_direct_masked_pipeline =
+                ds4_gpu_get_pipeline("kernel_dsv4_indexer_score_one_direct_masked");
+            if (!g_dsv4_indexer_score_one_direct_masked_pipeline) return 0;
+        }
+
+        ds4_gpu_dsv4_indexer_scores_masked_args args = {
+            .fused = {
+                .n_comp = n_comp,
+                .n_tokens = 1,
+                .n_head = n_head,
+                .head_dim = head_dim,
+                .pos0 = 0,
+                .ratio = 4,
+                .q_token_stride = (uint64_t)n_head * head_dim * sizeof(float),
+                .q_head_stride = (uint64_t)head_dim * sizeof(float),
+                .weights_token_stride = (uint64_t)n_head * sizeof(float),
+                .index_row_stride = (uint64_t)head_dim * sizeof(float),
+                .score_token_stride = (uint64_t)n_comp * sizeof(float),
+                .scale = scale,
+            },
+            .scored_chunks = scored_chunks,
+        };
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:g_dsv4_indexer_score_one_direct_masked_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:qbuf offset:ds4_gpu_tensor_offset(q) atIndex:1];
+        [enc setBuffer:wbuf offset:ds4_gpu_tensor_offset(weights) atIndex:2];
+        [enc setBuffer:compbuf offset:ds4_gpu_tensor_offset(index_comp) atIndex:3];
+        [enc setBuffer:bitsbuf offset:ds4_gpu_tensor_offset(resident_bits) atIndex:4];
+        [enc setBuffer:scorebuf offset:ds4_gpu_tensor_offset(scores) atIndex:5];
+        [enc setThreadgroupMemoryLength:(128u + 4u) * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(n_comp, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "masked indexer score")) return 0;
     }
 
     return 1;

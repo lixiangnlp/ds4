@@ -90,6 +90,9 @@ static ds4_engine *test_open_engine(bool quality) {
     /* DS4_TEST_MTP loads the MTP head on the fast engine so the speculative
      * verify regression can reuse it; draft=4 hits the multi-row verify path. */
     const char *mtp = getenv("DS4_TEST_MTP");
+    /* DS4_TEST_FLASHMEM points at converted FlashMemory retriever weights so
+     * the long-context regressions can run with lookahead gating enabled. */
+    const char *flashmem = getenv("DS4_TEST_FLASHMEM");
     ds4_engine_options opt = {
         .model_path = test_model_path(),
 #ifdef __APPLE__
@@ -108,6 +111,7 @@ static ds4_engine *test_open_engine(bool quality) {
             test_env_u32("DS4_TEST_SSD_STREAMING_PRELOAD_EXPERTS"),
         .mtp_path = (mtp && mtp[0] && !quality) ? mtp : NULL,
         .mtp_draft_tokens = (mtp && mtp[0] && !quality) ? 4 : 0,
+        .flashmem_path = (flashmem && flashmem[0]) ? flashmem : NULL,
     };
     TEST_ASSERT(ds4_engine_open(&engine, &opt) == 0);
     return engine;

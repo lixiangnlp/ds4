@@ -1520,6 +1520,8 @@ static cli_config parse_options(int argc, char **argv) {
             }
         } else if (!strcmp(arg, "--dir-steering-file")) {
             c.engine.directional_steering_file = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--flashmem")) {
+            c.engine.flashmem_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--expert-profile")) {
             c.engine.expert_profile_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dir-steering-ffn")) {

@@ -17,8 +17,8 @@ ROCM_SRCS := $(wildcard rocm/*.cuh)
 
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
-CORE_OBJS = ds4.o ds4_distributed.o ds4_ssd.o ds4_metal.o
-CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_ssd.o
+CORE_OBJS = ds4.o ds4_distributed.o ds4_ssd.o ds4_flashmem.o ds4_metal.o
+CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_ssd.o ds4_flashmem.o
 else
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 CUDA_HOME ?= /usr/local/cuda
@@ -28,8 +28,8 @@ ifneq ($(strip $(CUDA_ARCH)),)
 NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
 NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
-CORE_OBJS = ds4.o ds4_distributed.o ds4_ssd.o ds4_cuda.o
-CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_ssd.o
+CORE_OBJS = ds4.o ds4_distributed.o ds4_ssd.o ds4_flashmem.o ds4_cuda.o
+CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_ssd.o ds4_flashmem.o
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
 HIPCC ?= $(shell command -v hipcc 2>/dev/null || echo /opt/rocm/bin/hipcc)
 ROCM_ARCH ?= gfx1151
@@ -106,7 +106,7 @@ cuda:
 
 strix-halo:
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent \
-		CORE_OBJS="ds4.o ds4_distributed.o ds4_ssd.o ds4_rocm.o" \
+		CORE_OBJS="ds4.o ds4_distributed.o ds4_ssd.o ds4_flashmem.o ds4_rocm.o" \
 		CFLAGS="$(CFLAGS) -DDS4_ROCM_BUILD" \
 		DS4_LINK="$(HIPCC) $(ROCM_CFLAGS)" \
 		DS4_LINK_LIBS="$(ROCM_LDLIBS)"
@@ -139,8 +139,11 @@ cuda-regression: tests/cuda_long_context_smoke
 	./tests/cuda_long_context_smoke
 endif
 
-ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h
+ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_flashmem.h
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
+
+ds4_flashmem.o: ds4_flashmem.c ds4_flashmem.h
+	$(CC) $(CFLAGS) -c -o $@ ds4_flashmem.c
 
 ds4_ssd.o: ds4_ssd.c ds4_ssd.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_ssd.c
@@ -187,7 +190,7 @@ rax.o: rax.c rax.h rax_malloc.h
 linenoise.o: linenoise.c linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ linenoise.c
 
-ds4_cpu.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h
+ds4_cpu.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_flashmem.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4.c
 
 ds4_cli_cpu.o: ds4_cli.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h linenoise.h
@@ -231,7 +234,7 @@ else
 	$(NVCC) $(NVCCFLAGS) -o $@ ds4_agent_test.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJS) $(CUDA_LDLIBS)
 endif
 
-test: ds4_test ds4_agent_test ds4-eval q4k-dot-test
+test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-test
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
 	./ds4_test
@@ -240,5 +243,9 @@ q4k-dot-test: tests/test_q4k_dot.c
 	$(CC) -O2 -Wall -Wextra -std=c99 -o tests/test_q4k_dot tests/test_q4k_dot.c -lm -pthread
 	./tests/test_q4k_dot
 
+mxfp4-test: tests/test_mxfp4.c ds4_mxfp4.c ds4_mxfp4.h
+	$(CC) -O2 -Wall -Wextra -std=c99 -I. -o tests/test_mxfp4 tests/test_mxfp4.c ds4_mxfp4.c -lm
+	./tests/test_mxfp4
+
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test tests/test_q4k_dot *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test tests/test_q4k_dot tests/test_mxfp4 *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
