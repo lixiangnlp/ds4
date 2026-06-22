@@ -1,0 +1,7 @@
+{
+  "prefill_a":"37.05", "prefill_b":"54.70", "prefill_d":"+47.6% ⚠混淆",
+  "decode_a":"0.27",  "decode_b":"0.32",  "decode_d":"+18.5% ⚠混淆",
+  "kv_a":"649.2 MB",  "kv_b":"295.0 MB",  "kv_d":"−54.6% ✓确定",
+  "ram_a":"~75 GB",   "ram_b":"~74 GB",   "ram_d":"−~1 GB(粗粒度)",
+  "exp_a":"3387",     "exp_b":"3387",     "exp_d":"不变"
+}

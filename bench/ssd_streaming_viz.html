@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DS4 · SSD Streaming 推理可视化</title>
+<style>
+  :root{
+    --bg:#0b0e14; --panel:#131826; --panel2:#1a2133; --line:#27304a;
+    --ink:#e6ecff; --dim:#8a97b8; --accent:#5cb8ff;
+    --ssd:#2b3350; --uma:#15321f; --kv:#3a2350; --nr:#123048;
+    --hit:#37d67a; --miss:#ff9f43; --hot:#ff5d5d; --pipe:#5cb8ff;
+    --good:#37d67a; --warn:#ffcf5c;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:radial-gradient(1200px 600px at 70% -10%,#16203a 0,var(--bg) 60%);
+    color:var(--ink);font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif}
+  .wrap{max-width:1180px;margin:0 auto;padding:28px 22px 80px}
+  h1{font-size:24px;margin:0 0 4px;letter-spacing:.3px}
+  h1 .tag{font-size:12px;color:var(--dim);font-weight:500}
+  .sub{color:var(--dim);margin:0 0 20px;font-size:13px}
+  .spec{display:flex;flex-wrap:wrap;gap:8px;margin:14px 0 22px}
+  .chip{background:var(--panel);border:1px solid var(--line);border-radius:999px;padding:5px 12px;font-size:12px;color:var(--dim)}
+  .chip b{color:var(--ink);font-weight:600}
+  .grid{display:grid;grid-template-columns:1fr;gap:18px}
+  .card{background:linear-gradient(180deg,var(--panel),#101422);border:1px solid var(--line);
+    border-radius:16px;padding:18px 18px 16px}
+  .card h2{font-size:15px;margin:0 0 3px;display:flex;align-items:center;gap:8px}
+  .card .hint{color:var(--dim);font-size:12.5px;margin:0 0 14px}
+  .num{font-variant-numeric:tabular-nums}
+
+  /* memory bar */
+  .membar{height:46px;border-radius:10px;overflow:hidden;display:flex;border:1px solid var(--line);background:#0d1120}
+  .membar > div{display:flex;align-items:center;justify-content:center;font-size:11px;color:#dfe8ff;
+    transition:flex-basis .6s cubic-bezier(.3,.7,.2,1);white-space:nowrap;overflow:hidden;border-right:1px solid #0008}
+  .seg-nr{background:linear-gradient(180deg,#16486e,#0f2e49)}
+  .seg-cache{background:linear-gradient(180deg,#1d6b3e,#124a29)}
+  .seg-kv{background:linear-gradient(180deg,#5b2f86,#3a2350)}
+  .seg-act{background:linear-gradient(180deg,#5a4a1c,#3a3014)}
+  .seg-free{background:repeating-linear-gradient(45deg,#11162400,#11162400 7px,#1a2336 7px,#1a2336 14px)}
+  .legend{display:flex;flex-wrap:wrap;gap:14px;margin-top:10px;font-size:12px;color:var(--dim)}
+  .legend i{display:inline-block;width:11px;height:11px;border-radius:3px;margin-right:6px;vertical-align:-1px}
+
+  /* pipeline */
+  .stage{display:grid;grid-template-columns:200px 1fr 240px;gap:14px;align-items:stretch}
+  @media(max-width:820px){.stage{grid-template-columns:1fr}}
+  .store{background:var(--panel2);border:1px solid var(--line);border-radius:12px;padding:14px}
+  .store .t{font-size:12px;color:var(--dim);margin-bottom:8px}
+  .store .big{font-size:22px;font-weight:700}
+  .ssd .big{color:#9cc4ff}
+  .uma .big{color:#7ee0a6}
+  .pipe{position:relative;border:1px solid var(--line);border-radius:12px;background:#0c1120;overflow:hidden;min-height:120px}
+  .pipe .label{position:absolute;top:8px;left:12px;font-size:12px;color:var(--dim);z-index:3}
+  .pipe .bw{position:absolute;top:8px;right:12px;font-size:12px;color:var(--pipe);z-index:3;font-variant-numeric:tabular-nums}
+  .lane{position:absolute;left:0;right:0;top:50%;height:2px;background:linear-gradient(90deg,#1a2336,#2a3a60,#1a2336)}
+  .pkt{position:absolute;width:13px;height:13px;border-radius:3px;top:calc(50% - 6px);left:-20px;
+    box-shadow:0 0 10px #0006}
+  .pkt.miss{background:var(--miss)}
+  .pkt.nr{background:var(--nr);background:#3a86c8}
+
+  /* layers */
+  .layers{display:flex;gap:4px;flex-wrap:wrap;margin-top:6px}
+  .layer{flex:1 1 18px;min-width:14px;height:30px;border-radius:5px;background:#1a2234;border:1px solid #232c44;
+    position:relative;transition:background .15s,box-shadow .15s}
+  .layer.active{box-shadow:0 0 0 2px var(--pipe),0 0 14px #5cb8ff66;background:#22314e}
+  .layer.done{background:#1d3326}
+  .expts{display:flex;gap:4px;margin-top:12px;flex-wrap:wrap}
+  .ex{width:26px;height:26px;border-radius:6px;background:#1a2234;border:1px solid #2a3450;
+    display:flex;align-items:center;justify-content:center;font-size:10px;color:#7c8bb0;transition:all .2s}
+  .ex.hit{background:#16432a;border-color:var(--hit);color:#bdf5d2}
+  .ex.miss{background:#4a2f12;border-color:var(--miss);color:#ffd9ad;animation:pop .3s}
+  @keyframes pop{0%{transform:scale(.6)}60%{transform:scale(1.15)}100%{transform:scale(1)}}
+
+  /* gauges */
+  .gauges{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:4px}
+  @media(max-width:560px){.gauges{grid-template-columns:1fr}}
+  .gauge{background:var(--panel2);border:1px solid var(--line);border-radius:12px;padding:12px 14px}
+  .gauge .t{font-size:12px;color:var(--dim);display:flex;justify-content:space-between}
+  .gauge .v{font-size:20px;font-weight:700;font-variant-numeric:tabular-nums;margin:2px 0 8px}
+  .track{height:9px;border-radius:6px;background:#0d1120;overflow:hidden}
+  .fill{height:100%;width:0;border-radius:6px;transition:width .25s,background .25s}
+  .fill.bw{background:linear-gradient(90deg,#2e6cff,#5cb8ff)}
+  .fill.heat{background:linear-gradient(90deg,#37d67a,#ffcf5c,#ff5d5d)}
+  .ceil{font-size:11px;color:var(--dim);margin-top:4px}
+
+  .stat{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:6px}
+  @media(max-width:680px){.stat{grid-template-columns:repeat(2,1fr)}}
+  .stat .b{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
+  .stat .b .k{font-size:11px;color:var(--dim)}
+  .stat .b .n{font-size:18px;font-weight:700;font-variant-numeric:tabular-nums}
+
+  .controls{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:2px 0 6px}
+  button{background:#23314e;color:#dbe6ff;border:1px solid #34466e;border-radius:9px;padding:8px 14px;
+    font-size:13px;cursor:pointer;transition:.15s}
+  button:hover{background:#2c3d61}
+  button.primary{background:#2e6cff;border-color:#5588ff}
+  button.primary:hover{background:#3a78ff}
+  .seg-ctrl{display:inline-flex;border:1px solid #34466e;border-radius:9px;overflow:hidden}
+  .seg-ctrl button{border:0;border-radius:0;border-right:1px solid #34466e}
+  .seg-ctrl button:last-child{border-right:0}
+  .seg-ctrl button.on{background:#2e6cff}
+  label.toggle{display:inline-flex;align-items:center;gap:8px;font-size:13px;color:var(--dim);cursor:pointer;
+    background:var(--panel2);border:1px solid var(--line);padding:7px 12px;border-radius:9px}
+  .callout{background:#0f1830;border:1px solid #24407a;border-left:3px solid var(--pipe);border-radius:10px;
+    padding:12px 14px;color:#cdd9f5;font-size:13px;margin-top:14px}
+  .callout b{color:#9cc4ff}
+  .small{font-size:12px;color:var(--dim)}
+  .kbd{font:12px ui-monospace,Menlo,monospace;background:#0d1322;border:1px solid #2a3450;border-radius:5px;padding:1px 6px;color:#bcd}
+  table{border-collapse:collapse;width:100%;font-size:13px;margin-top:6px}
+  th,td{text-align:right;padding:7px 10px;border-bottom:1px solid var(--line)}
+  th:first-child,td:first-child{text-align:left;color:var(--dim)}
+  td.win{color:var(--good);font-weight:600}
+  .pend{color:var(--dim);font-size:12px;margin-top:8px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>DS4 · SSD Streaming 推理可视化 <span class="tag">DeepSeek-V4-Pro · 433 GB MoE on 128 GB Mac</span></h1>
+  <p class="sub">内存与 SSD 如何配合、MoE 各层专家参数如何按需搬运——以及 PCIe 5.0 带宽与发热如何制约解码速度。</p>
+
+  <div class="spec" id="spec"></div>
+
+  <div class="grid">
+
+    <!-- 1. memory map -->
+    <div class="card">
+      <h2>① 统一内存里放什么 · SSD 上放什么</h2>
+      <p class="hint">模型 433 GB &gt;&gt; 内存 128 GB,不可能全驻留。只有<b>非路由权重</b>和一部分<b>热门专家</b>常驻内存;其余 ~86% 的专家冷数据留在 SSD,用到才流式拉取。</p>
+      <div class="membar" id="membar">
+        <div class="seg-nr"  id="seg-nr">非路由 27.4G</div>
+        <div class="seg-cache" id="seg-cache">专家缓存 58.6G</div>
+        <div class="seg-kv"  id="seg-kv">KV 0.4G</div>
+        <div class="seg-act" id="seg-act">激活</div>
+        <div class="seg-free" id="seg-free">空闲</div>
+      </div>
+      <div class="legend">
+        <span><i style="background:#16486e"></i>非路由权重(常驻,文件 mmap)</span>
+        <span><i style="background:#1d6b3e"></i>热门专家缓存(常驻)</span>
+        <span><i style="background:#5b2f86"></i>KV cache(FP8 优化对象)</span>
+        <span><i style="background:#5a4a1c"></i>激活/scratch</span>
+        <span><i style="background:#1a2336"></i>空闲余量</span>
+      </div>
+      <div class="callout" id="mem-callout"></div>
+    </div>
+
+    <!-- 2. transport animation -->
+    <div class="card">
+      <h2>② 一个 token 在各层如何搬运参数</h2>
+      <p class="hint">解码每生成 1 个 token,要顺序穿过全部 <span id="nlayer2"></span> 层。每层的<b>路由器</b>从该层专家池里挑 top-k 个专家:命中缓存→内存里直接算(绿);未命中→从 SSD 经 PCIe 流式拉 17.72 MiB/个(橙),再塞进缓存。</p>
+
+      <div class="controls">
+        <button class="primary" id="play">▶ 解码一个 token</button>
+        <button id="auto">⟲ 连续解码</button>
+        <button id="reset">重置缓存</button>
+        <div class="seg-ctrl" id="mode">
+          <button data-mode="decode" class="on">Decode(逐 token)</button>
+          <button data-mode="prefill">Prefill(批量)</button>
+        </div>
+        <label class="toggle"><input type="checkbox" id="fp8"> 开启 <b style="color:#c9a6ff">DS4_METAL_FP8_KV_STORE</b></label>
+      </div>
+
+      <div class="stage">
+        <div class="store ssd">
+          <div class="t">SSD · PCIe 5.0 NVMe</div>
+          <div class="big">433 GB</div>
+          <div class="small" id="ssd-detail">冷专家 ~23k 个<br>已流式读取 <span id="streamed">0</span> GB</div>
+        </div>
+        <div class="pipe" id="pipe">
+          <div class="label">PCIe 5.0 ·搬运中</div>
+          <div class="bw" id="pipe-bw">0.0 GB/s</div>
+          <div class="lane"></div>
+        </div>
+        <div class="store uma">
+          <div class="t">统一内存 · UMA</div>
+          <div class="big">128 GB</div>
+          <div class="small">缓存命中率 <span id="hitrate">—</span><br>缓存专家 <span id="cachefill">0</span> / <span id="cachecap">3387</span></div>
+        </div>
+      </div>
+
+      <div style="margin-top:14px">
+        <div class="small">模型各层(当前处理层高亮):</div>
+        <div class="layers" id="layers"></div>
+      </div>
+      <div>
+        <div class="small" style="margin-top:12px">当前层路由选中的专家:</div>
+        <div class="expts" id="expts"></div>
+      </div>
+
+      <div class="stat">
+        <div class="b"><div class="k">本 token 命中率</div><div class="n num" id="s-hit">—</div></div>
+        <div class="b"><div class="k">本 token SSD 读取</div><div class="n num" id="s-bytes">0 MB</div></div>
+        <div class="b"><div class="k">prefill / decode</div><div class="n num" id="s-mode">decode</div></div>
+        <div class="b"><div class="k">本 token 估算耗时</div><div class="n num" id="s-time">—</div></div>
+      </div>
+    </div>
+
+    <!-- 3. bandwidth + thermal -->
+    <div class="card">
+      <h2>③ PCIe 5.0 带宽 · SSD 发热 · 降频</h2>
+      <p class="hint">Prefill 批量摊薄读取→几乎打满 14.5 GB/s;Decode 单 token 延迟受限,带宽利用低。<b>持续高带宽读取会让 NVMe 主控升温</b>,触及阈值后降频,反过来拖慢推理。缓存命中=不读 SSD=既省带宽又少发热。</p>
+      <div class="gauges">
+        <div class="gauge">
+          <div class="t"><span>瞬时带宽</span><span id="g-bw-pct">0%</span></div>
+          <div class="v"><span id="g-bw">0.0</span> GB/s</div>
+          <div class="track"><div class="fill bw" id="g-bw-fill"></div></div>
+          <div class="ceil">峰值上限 14.5 GB/s（PCIe 5.0 x4）</div>
+        </div>
+        <div class="gauge">
+          <div class="t"><span>SSD 主控温度</span><span id="g-heat-state">正常</span></div>
+          <div class="v"><span id="g-heat">—</span></div>
+          <div class="track"><div class="fill heat" id="g-heat-fill"></div></div>
+          <div class="ceil" id="g-heat-note">持续满速读取 → 升温 → 降频</div>
+        </div>
+      </div>
+      <div class="callout" id="bw-callout"></div>
+    </div>
+
+    <!-- 4. A/B results -->
+    <div class="card">
+      <h2>④ A/B 实测:原始引擎 vs FP8 KV 优化</h2>
+      <p class="hint">同一长文本(32768 上下文)、同一 SSD streaming 配置,两次跑间隔 5 分钟消除热偏置。数字会在评测跑完后由脚本回填。</p>
+      <table id="ab">
+        <thead><tr><th>指标</th><th>原始 (DS4_DISABLE_KV_OPTS)</th><th>FP8 KV 优化</th><th>变化</th></tr></thead>
+        <tbody id="ab-body">
+          <tr><td>prefill 吞吐 (tok/s)</td><td class="num" data-k="prefill_a">—</td><td class="num" data-k="prefill_b">—</td><td class="num" data-k="prefill_d">待回填</td></tr>
+          <tr><td>decode 吞吐 (tok/s)</td><td class="num" data-k="decode_a">—</td><td class="num" data-k="decode_b">—</td><td class="num" data-k="decode_d">待回填</td></tr>
+          <tr><td>KV cache 大小</td><td class="num" data-k="kv_a">—</td><td class="num" data-k="kv_b">—</td><td class="num" data-k="kv_d">待回填</td></tr>
+          <tr><td>峰值 phys_footprint (RAM)</td><td class="num" data-k="ram_a">—</td><td class="num" data-k="ram_b">—</td><td class="num" data-k="ram_d">待回填</td></tr>
+          <tr><td>缓存专家数 (SSD 流量代理)</td><td class="num" data-k="exp_a">—</td><td class="num" data-k="exp_b">—</td><td class="num" data-k="exp_d">待回填</td></tr>
+          <tr><td>SSD 上模型存储</td><td class="num">433 GB</td><td class="num">433 GB</td><td class="num">不变（同一文件）</td></tr>
+        </tbody>
+      </table>
+      <div class="callout" id="ab-callout"><b>怎么读这张表:</b>KV cache <b>−54.6%</b> 是按布局确定性计算的,可信——这是 FP8 的实打实收益。
+      prefill/decode 的 <b>+47.6% / +18.5%</b> 标了 ⚠混淆:baseline 先跑(冷),optimized 后跑,同一 prompt 下 433GB 模型的热门专家已被 macOS 统一缓冲缓存预热,重复读大量命中 RAM——这个加速主要来自<b>缓存预热</b>而非 FP8 内核。
+      要隔离真实速度效应需<b>反序再跑一次取平均</b>(PR 原方法)。缓存专家数 3387 两次相同 → SSD 流量预算不变。</div>
+    </div>
+
+  </div>
+  <p class="pend">数据源:ds4-bench(M5 Max / Metal 4.1)实跑日志 + 源码 streaming 预算。本页为单文件,可直接用浏览器打开,也可 <span class="kbd">node bench/render_viz.js</span> 截图。</p>
+</div>
+
+<script>
+/* ---- real numbers from the running model (ds4-bench log + source) ---- */
+const CFG = {
+  ramGiB: 128, modelGB: 433, pcie: 14.5,           // hardware
+  workingSet: 107.52, budget: 86.02,               // streaming auto budget (GiB)
+  nonRouted: 27.40, expertMiB: 17.72,              // resident weights / per-expert
+  cacheExperts: 3387, cacheGiB: 58.61,             // hot expert cache
+  nLayers: 61, topk: 8,                            // MoE shape (display)
+  kvBaseGB: 0.93, kvFp8GB: 0.41,                   // KV @ ~32k (orig vs fp8, GB)
+  prefillTps: 33.87, decodeTps: 0.41,              // measured (smoke frontier)
+  // total routed experts (approx): routed bytes / per-expert
+};
+CFG.totalExperts = Math.round((CFG.modelGB*1073.74 - CFG.nonRouted*1024) / CFG.expertMiB); // ~ in MiB
+const $ = s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
+
+/* spec chips */
+$('#spec').innerHTML = [
+  ['硬件','Apple M5 Max · 128 GiB UMA'],
+  ['SSD','PCIe 5.0 NVMe · 14.5 GB/s'],
+  ['模型','DeepSeek-V4-Pro IQ2-XXS · 433 GB'],
+  ['常驻','非路由 27.4 GiB + 缓存 3387 专家 (58.6 GiB)'],
+  ['每专家','17.72 MiB'],
+].map(([k,v])=>`<span class="chip"><b>${k}</b> · ${v}</span>`).join('');
+
+$('#nlayer2').textContent = CFG.nLayers;
+$('#cachecap').textContent = CFG.cacheExperts;
+$('#mem-callout').innerHTML =
+  `auto 预算把统一内存的 80%(<b>${CFG.budget} GiB</b>)分给「模型+缓存」:`+
+  `非路由权重 <b>${CFG.nonRouted} GiB</b> 常驻,剩下 <b>${CFG.cacheGiB} GiB</b> 缓存 <b>${CFG.cacheExperts}</b> 个最热专家`+
+  `(全模型约 ${CFG.totalExperts.toLocaleString()} 个路由专家,缓存命中约 ${(CFG.cacheExperts/CFG.totalExperts*100).toFixed(0)}%)。`+
+  `KV cache 与激活从余下的 20% 余量里出——这正是 <b>FP8 KV</b> 腾地方的位置。`;
+$('#bw-callout').innerHTML =
+  `实测 prefill 阶段 disk0 读取 <b>~10 GB/s</b>(接近 14.5 上限);decode 阶段带宽利用低但<b>每个 miss 都是一次 17.72 MiB 随机读 + 等待</b>。`+
+  `策略上:把<b>命中率</b>做高(更大常驻缓存 / 流行度预载 / 把 FP8 省下的 RAM 喂给缓存)能同时降低带宽压力和发热——这是 PCIe 5.0 + 散热受限场景的关键。`;
+
+/* ---------- memory bar widths (react to FP8 toggle) ---------- */
+function renderMem(fp8){
+  const kv = fp8?CFG.kvFp8GB:CFG.kvBaseGB;
+  const act = 2.0;
+  const used = CFG.nonRouted + CFG.cacheGiB + kv + act;
+  const free = Math.max(2, CFG.ramGiB - used);
+  const tot = CFG.nonRouted + CFG.cacheGiB + kv + act + free;
+  const pc = g=>(g/tot*100).toFixed(2)+'%';
+  $('#seg-nr').style.flexBasis    = pc(CFG.nonRouted);
+  $('#seg-cache').style.flexBasis = pc(CFG.cacheGiB);
+  $('#seg-kv').style.flexBasis    = pc(kv);
+  $('#seg-act').style.flexBasis   = pc(act);
+  $('#seg-free').style.flexBasis  = pc(free);
+  $('#seg-kv').textContent = `KV ${kv.toFixed(2)}G`;
+  $('#seg-nr').textContent = `非路由 ${CFG.nonRouted}G`;
+  $('#seg-cache').textContent = `专家缓存 ${CFG.cacheGiB}G`;
+  $('#seg-free').textContent = `空闲 ${free.toFixed(0)}G`;
+}
+
+/* ---------- layer grid ---------- */
+const layersEl = $('#layers');
+for(let i=0;i<CFG.nLayers;i++){const d=document.createElement('div');d.className='layer';layersEl.appendChild(d);}
+const layerNodes = $$('.layer');
+
+/* ---------- expert cache model ---------- */
+let cache = new Set();      // cached expert ids (popularity-warmed)
+let streamedBytes = 0;      // cumulative GB
+let mode = 'decode';
+let fp8 = false;
+
+// Zipf-ish popularity: low ids are "hot" and pre-seeded into cache.
+function seedCache(){
+  cache = new Set();
+  for(let i=0;i<CFG.cacheExperts;i++) cache.add(i);
+  streamedBytes = 0; $('#streamed').textContent='0';
+  $('#cachefill').textContent = cache.size>CFG.cacheExperts?CFG.cacheExperts:cache.size;
+  layerNodes.forEach(n=>n.className='layer');
+  $('#hitrate').textContent='—'; $('#s-hit').textContent='—';
+  $('#s-bytes').textContent='0 MB'; $('#s-time').textContent='—';
+  $('#expts').innerHTML=''; heat=20; renderHeat();
+}
+function pickExpert(){
+  // popularity-weighted draw over total experts (hot = small id)
+  const r = Math.random();
+  const skew = Math.pow(r, 2.2);                 // bias toward hot
+  return Math.floor(skew * CFG.totalExperts);
+}
+
+/* ---------- gauges / thermal ---------- */
+let heat = 20;                                   // 0..100
+function renderHeat(){
+  $('#g-heat-fill').style.width = heat+'%';
+  $('#g-heat').textContent = heat<60?'正常':heat<82?'偏热':'降频中';
+  const st = heat<60?'正常':heat<82?'升温':'⚠ 降频';
+  $('#g-heat-state').textContent = st;
+  $('#g-heat-note').textContent = heat>=82
+    ? '已触发热降频:带宽被限,decode 进一步变慢' : '持续满速读取 → 升温 → 降频';
+}
+function renderBW(gbps){
+  const pct = Math.min(100, gbps/CFG.pcie*100);
+  $('#g-bw').textContent = gbps.toFixed(1);
+  $('#g-bw-pct').textContent = pct.toFixed(0)+'%';
+  $('#g-bw-fill').style.width = pct+'%';
+  $('#pipe-bw').textContent = gbps.toFixed(1)+' GB/s';
+}
+
+/* ---------- packet animation through the pipe ---------- */
+function flyPacket(kind){
+  const pipe = $('#pipe');
+  const p = document.createElement('div');
+  p.className = 'pkt '+kind;
+  pipe.appendChild(p);
+  const w = pipe.clientWidth+30;
+  p.animate([{transform:'translateX(0)'},{transform:`translateX(${w}px)`}],
+    {duration: mode==='prefill'?420:900, easing:'linear'}).onfinish=()=>p.remove();
+}
+
+/* ---------- one decode/prefill step ---------- */
+let running=false, autoTimer=null;
+async function step(){
+  if(running) return; running=true;
+  const exptsEl = $('#expts');
+  let hits=0, misses=0, bytes=0;
+  const heatRate = mode==='prefill'?7:2;
+
+  for(let L=0; L<CFG.nLayers; L++){
+    layerNodes.forEach(n=>{if(n.classList.contains('active'))n.className='layer done';});
+    layerNodes[L].classList.add('active');
+    exptsEl.innerHTML='';
+    // route top-k experts for this layer
+    const chosen=[];
+    for(let k=0;k<CFG.topk;k++) chosen.push(pickExpert());
+    for(const id of chosen){
+      const e=document.createElement('div'); e.className='ex'; e.textContent=(id%1000);
+      exptsEl.appendChild(e);
+      const hit = cache.has(id);
+      if(hit){ e.classList.add('hit'); hits++; }
+      else{
+        e.classList.add('miss'); misses++; bytes += CFG.expertMiB;
+        flyPacket('miss');
+        cache.add(id);                            // bring into cache (slab/LRU abstracted)
+        if(cache.size>CFG.cacheExperts){          // evict a random hot-tail entry
+          const it=cache.values(); cache.delete(it.next().value);
+        }
+        heat = Math.min(100, heat+heatRate);
+      }
+    }
+    // instantaneous bandwidth: prefill amortizes → high; decode sparse → low
+    const layerBytesMiB = misses>0 ? CFG.expertMiB*1 : 0;
+    let gbps = mode==='prefill'
+      ? Math.min(CFG.pcie, 9.5 + Math.random()*4)
+      : (misses? Math.min(CFG.pcie*0.5, 1.5+Math.random()*2) : 0.2);
+    if(heat>=82) gbps*=0.55;                      // thermal throttle
+    renderBW(gbps);
+    // cool slightly when no miss
+    if(misses===0) heat=Math.max(20,heat-1);
+    renderHeat();
+    $('#cachefill').textContent = Math.min(cache.size,CFG.cacheExperts);
+    await sleep(mode==='prefill'?22:55);
+  }
+  layerNodes.forEach(n=>n.className=n.classList.contains('active')?'layer done':n.className);
+
+  const tot=hits+misses;
+  streamedBytes += bytes/1024;
+  $('#streamed').textContent = streamedBytes.toFixed(2);
+  const hr=(hits/tot*100);
+  $('#hitrate').textContent = hr.toFixed(0)+'%';
+  $('#s-hit').textContent = hr.toFixed(0)+'%';
+  $('#s-bytes').textContent = bytes.toFixed(0)+' MB';
+  $('#s-mode').textContent = mode;
+  // est time: decode dominated by miss-count * random-read latency; prefill batched
+  const estMs = mode==='prefill'
+    ? (CFG.nLayers*CFG.topk*0.05)
+    : (misses* (heat>=82?9:6) + tot*0.4);
+  $('#s-time').textContent = mode==='prefill'
+    ? '~批量摊薄' : (estMs/1000).toFixed(2)+' s';
+  renderBW(0.2);
+  running=false;
+}
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+
+/* ---------- wires ---------- */
+$('#play').onclick=()=>step();
+$('#reset').onclick=()=>seedCache();
+$('#auto').onclick=function(){
+  if(autoTimer){clearInterval(autoTimer);autoTimer=null;this.textContent='⟲ 连续解码';this.classList.remove('primary');}
+  else{this.textContent='⏸ 停止';this.classList.add('primary');
+    autoTimer=setInterval(()=>{if(!running)step();}, mode==='prefill'?1700:3600);}
+};
+$$('#mode button').forEach(b=>b.onclick=function(){
+  $$('#mode button').forEach(x=>x.classList.remove('on'));this.classList.add('on');
+  mode=this.dataset.mode;$('#s-mode').textContent=mode;
+});
+$('#fp8').onchange=function(){fp8=this.checked;renderMem(fp8);
+  $('#ab-callout').style.borderLeftColor = fp8?'#c9a6ff':'#5cb8ff';};
+
+/* ---------- A/B injection (filled by render script after bench) ---------- */
+function applyAB(d){
+  if(!d) return;
+  const set=(k,v)=>{const el=document.querySelector(`[data-k="${k}"]`); if(el)el.textContent=v;};
+  for(const k in d) set(k,d[k]);
+}
+// Inline fallback so the page shows real A/B numbers even when opened as file://
+// (fetch is blocked on file://). Re-run bench/collect_results.sh to refresh, then
+// paste the new ab_results.json here, or serve the folder over http.
+const AB_INLINE = {
+  "prefill_a":"37.05","prefill_b":"54.70","prefill_d":"+47.6% ⚠混淆",
+  "decode_a":"0.27","decode_b":"0.32","decode_d":"+18.5% ⚠混淆",
+  "kv_a":"649.2 MB","kv_b":"295.0 MB","kv_d":"−54.6% ✓确定",
+  "ram_a":"~75 GB","ram_b":"~74 GB","ram_d":"−~1 GB(粗粒度)",
+  "exp_a":"3387","exp_b":"3387","exp_d":"不变"
+};
+applyAB(AB_INLINE);
+fetch('ab_results.json').then(r=>r.ok?r.json():null).then(applyAB).catch(()=>{});
+
+/* init */
+renderMem(false); seedCache(); renderBW(0); renderHeat();
+</script>
+</body>
+</html>
